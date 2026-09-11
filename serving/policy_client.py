@@ -17,6 +17,7 @@ class RemotePolicy:
         self.host, self.port = host, port
         self.net_ms_log = []       # 왕복(네트워크+추론) 시간
         self.infer_ms_log = []     # 서버가 보고한 순수 추론 시간
+        self.energy_j_log = []     # 서버가 predict() 호출 구간에서 직접 잰 에너지(J). 미측정 시 None.
 
     def ping(self) -> dict:
         send_obj(self.sock, {"__cmd__": "ping"})
@@ -33,13 +34,32 @@ class RemotePolicy:
         resp = recv_obj(self.sock)
         self.net_ms_log.append((time.perf_counter() - t0) * 1000)
         self.infer_ms_log.append(resp.get("infer_ms", float("nan")))
+        self.energy_j_log.append(resp.get("infer_energy_j"))  # 서버 미측정 시 None
         return np.asarray(resp["action"], dtype=np.float32)
+
+    @property
+    def last_rtt_ms(self) -> float:
+        """직전 predict() 호출의 왕복(네트워크+추론) 시간 — raw 곡선(제어주파수 스윕용) 판정에 쓴다."""
+        return self.net_ms_log[-1] if self.net_ms_log else float("nan")
+
+    @property
+    def last_infer_ms(self) -> float:
+        """직전 predict() 호출의 서버측 순수 추론 시간 — adjusted(net-free) 곡선 판정에 쓴다."""
+        return self.infer_ms_log[-1] if self.infer_ms_log else float("nan")
+
+    @property
+    def last_energy_j(self):
+        """직전 predict() 호출 구간의 실측 에너지(J). 서버가 --measure-energy 없이 뜬 경우 None."""
+        return self.energy_j_log[-1] if self.energy_j_log else None
 
     def stats(self) -> dict:
         def _m(x):
             return float(np.mean(x)) if x else float("nan")
+
+        energy_vals = [e for e in self.energy_j_log if e is not None]
         return {"rtt_ms_mean": _m(self.net_ms_log),
                 "server_infer_ms_mean": _m(self.infer_ms_log),
+                "total_energy_j_mean": _m(energy_vals) if energy_vals else float("nan"),
                 "n_calls": len(self.net_ms_log)}
 
     def close(self):

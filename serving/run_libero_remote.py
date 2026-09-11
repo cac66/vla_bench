@@ -8,7 +8,12 @@ LIBERO closed-loop rollout을 돌리되, 정책 추론은 Jetson 서버(RemotePo
   - suite별 성공률 분해: 여러 suite를 한 번에 순회해 결과를 나란히 CSV에 쌓는다.
   - action smoothness(LDLJ+JerkRMS): 성공 episode의 action 시퀀스만 계산.
   - 제어주파수-성공률 곡선: --target-hz 로 인위적 지연을 주입해 스윕.
-  - success rate 통계: --seeds 로 3회(기본) 반복 후 평균/표준편차/95% CI 보고.
+    → raw(실측 RTT 기준)와 adjusted(서버 infer_ms만 기준, 네트워크 시간 제외) 두 곡선을
+      동시에 산출한다. RemotePolicy가 왕복(net)과 서버측 순수 추론(infer)을 분리 로깅하므로
+      가능해졌다 — 자세한 배경은 run_episode()/run_suite_once() docstring 참조.
+  - success rate 통계: --seeds 로 3회(기본) 반복 후 평균/표준편차/95% CI 보고(raw/adjusted 각각).
+  - episode 직접실측 에너지: 서버가 --measure-energy로 predict() 호출별 에너지를 함께 보내면,
+    성공 episode들의 총 에너지 평균을 energy_per_success_j_direct로 CSV에 남긴다.
 
 실행 예)
   # 기본(단일 suite, 3 seed, 지연 없음)
@@ -77,11 +82,19 @@ def obs_to_dict(obs, instruction):
     }
 
 
-def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None):
+def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
+                delay_basis="rtt"):
     """
     한 episode를 closed-loop으로 실행한다.
-    target_hz가 주어지면 매 step 후 (1/target_hz - 실제소요) 만큼 sleep해 제어주파수를 강제한다.
-    반환: (success: bool, action_seq: np.ndarray [T, action_dim])
+    target_hz가 주어지면 매 step 후 지연을 주입해 제어주파수를 강제하되,
+    무엇을 "이 step이 예산을 넘겼는가"의 기준으로 쓸지는 delay_basis가 결정한다.
+      - "rtt"  : 실측 왕복시간(policy.predict() 호출의 네트워크+추론) 기준 — 곡선 A(raw).
+                 실제 decoupled 배포에서 체감하는 제어주파수를 재현한다.
+      - "infer": 서버가 보고한 순수 추론시간(policy.last_infer_ms) 기준 — 곡선 B(adjusted).
+                 네트워크 왕복을 뺀, "순수 on-device였다면"을 재해석한 판정이다.
+    반환: dict(success: bool, action_seq: np.ndarray [T, action_dim], energy_j: float|None)
+      energy_j는 이 episode 동안 서버가 실측한 에너지 총합(predict() 호출별 infer_energy_j의 합).
+      서버가 에너지 측정을 지원하지 않으면(--measure-energy 미지정) None.
 
     주의(수정): 사설 메서드 env._get_observations()를 쓰지 않는다. LIBERO/robosuite
     버전에 따라 존재 여부·래핑 구조(env vs env.env)가 달라 깨지기 쉽기 때문이다.
@@ -95,37 +108,57 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None)
 
     done = False
     actions = []
+    energy_total = 0.0
+    energy_recorded = False
 
     for _ in range(max_steps):
         t0 = time.perf_counter()
         action = policy.predict(obs_to_dict(obs, instruction))
         elapsed = time.perf_counter() - t0
 
+        e = policy.last_energy_j
+        if e is not None:
+            energy_total += e
+            energy_recorded = True
+
         actions.append(np.asarray(action, dtype=np.float32))
         obs, reward, done, info = env.step(action.tolist())  # 다음 루프의 obs를 여기서 확보
 
         if target_hz:
             budget = 1.0 / target_hz
-            if elapsed < budget:
-                time.sleep(budget - elapsed)
+            basis_elapsed = elapsed if delay_basis == "rtt" else (policy.last_infer_ms / 1000.0)
+            if basis_elapsed < budget:
+                time.sleep(budget - basis_elapsed)
 
         if done:
             break
 
     action_seq = np.stack(actions) if actions else np.zeros((0, 7), np.float32)
-    return bool(done), action_seq
+    return {"success": bool(done), "action_seq": action_seq,
+            "energy_j": energy_total if energy_recorded else None}
 
 
 def run_suite_once(policy, suite_name, n_tasks, episodes, seed, out_csv,
                    artifact, target_hz=None):
     """
-    한 suite를 한 seed로 1회 실행. 성공률 + smoothness(성공 episode 평균)를 반환.
+    한 suite를 한 seed로 1회 실행. 성공률(raw/adjusted 두 계열) + smoothness(성공 episode 평균)
+    + episode 직접실측 에너지를 반환한다.
     seed는 에피소드 서브샘플링(초기상태 셔플)에 사용해 실행 간 변동을 만든다.
+
+    raw vs adjusted (구현 방식: 독립 rollout — 정확도 우선):
+      target_hz가 주어지면 같은 (task, init_state)를 raw 기준(elapsed=RTT)과 adjusted
+      기준(elapsed=서버 infer_ms) 각각으로 "독립적으로" 두 번 굴린다. 지연 주입 위치가
+      다르면 이후 물리 시뮬레이션 진행이 달라져(action이 늦게 나갈수록 env가 그만큼
+      "밀린" 상태에서 다음 obs를 받음) 같은 rollout에서 두 판정을 동시에 내는 방식은
+      정확하지 않기 때문이다. target_hz가 없으면(지연 주입 자체가 없으므로) 두 기준이
+      물리적으로 동일한 rollout이 되어 raw 결과를 그대로 재사용하고 두 번째 rollout은
+      건너뛴다(불필요한 비용 절감).
     """
     rng = np.random.RandomState(seed)
     max_steps = MAX_STEPS.get(suite_name, 300)
-    total, success = 0, 0
+    total, success_raw, success_adjusted = 0, 0, 0
     ldlj_list, jerkrms_list = [], []
+    success_energy_list = []  # raw rollout 기준, 성공 episode들의 실측 총 에너지(J)
 
     dt = 1.0 / target_hz if target_hz else 1.0  # smoothness 계산용 시간 스케일
 
@@ -133,58 +166,127 @@ def run_suite_once(policy, suite_name, n_tasks, episodes, seed, out_csv,
         env, init_states, instruction = make_env(suite_name, task_id)
         order = rng.permutation(len(init_states))[:min(episodes, len(init_states))]
         for idx in order:
-            ok, action_seq = run_episode(policy, env, init_states[idx], instruction,
-                                         max_steps, target_hz)
+            res_raw = run_episode(policy, env, init_states[idx], instruction,
+                                  max_steps, target_hz, delay_basis="rtt")
             total += 1
-            success += int(ok)
-            if ok and len(action_seq) >= 5:
-                sm = compute_smoothness(action_seq, dt=dt, success=True)
+            success_raw += int(res_raw["success"])
+            if res_raw["success"] and len(res_raw["action_seq"]) >= 5:
+                sm = compute_smoothness(res_raw["action_seq"], dt=dt, success=True)
                 if sm["smoothness_ldlj"] != "NA":
                     ldlj_list.append(sm["smoothness_ldlj"])
                 if sm["smoothness_jerkrms"] != "NA":
                     jerkrms_list.append(sm["smoothness_jerkrms"])
+            if res_raw["success"] and res_raw["energy_j"] is not None:
+                success_energy_list.append(res_raw["energy_j"])
+
+            if target_hz:
+                res_adj = run_episode(policy, env, init_states[idx], instruction,
+                                      max_steps, target_hz, delay_basis="infer")
+                success_adjusted += int(res_adj["success"])
+            else:
+                success_adjusted += int(res_raw["success"])
         env.close()
 
-    rate = 100.0 * success / max(total, 1)
+    rate_raw = 100.0 * success_raw / max(total, 1)
+    rate_adjusted = 100.0 * success_adjusted / max(total, 1)
     mean_ldlj = float(np.mean(ldlj_list)) if ldlj_list else float("nan")
     mean_jerk = float(np.mean(jerkrms_list)) if jerkrms_list else float("nan")
+    energy_per_success_j_direct = (
+        round(float(np.mean(success_energy_list)), 4) if success_energy_list else "NA"
+    )
+
+    stats = policy.stats()
+    network_overhead_ms_mean = (
+        stats["rtt_ms_mean"] - stats["server_infer_ms_mean"]
+        if not (np.isnan(stats["rtt_ms_mean"]) or np.isnan(stats["server_infer_ms_mean"]))
+        else float("nan")
+    )
 
     row = {"name": artifact, "suite": suite_name, "seed": seed,
            "target_hz": target_hz if target_hz else "NA",
-           "episodes": total, "success": success, "success_rate_pct": round(rate, 2),
+           "episodes": total,
+           "success": success_raw, "success_rate_pct": round(rate_raw, 2),  # 하위 호환 alias(raw)
+           "success_raw": success_raw, "success_rate_pct_raw": round(rate_raw, 2),
+           "success_adjusted": success_adjusted,
+           "success_rate_pct_adjusted": round(rate_adjusted, 2),
            "smoothness_ldlj_mean": round(mean_ldlj, 4) if not np.isnan(mean_ldlj) else "NA",
            "smoothness_jerkrms_mean": round(mean_jerk, 6) if not np.isnan(mean_jerk) else "NA",
            "n_success_episodes_for_smoothness": len(ldlj_list),
-           **policy.stats()}
+           "energy_per_success_j_direct": energy_per_success_j_direct,
+           "n_success_episodes_for_energy": len(success_energy_list),
+           "network_overhead_ms_mean": round(network_overhead_ms_mean, 4)
+                                        if not np.isnan(network_overhead_ms_mean) else "NA",
+           **stats}
     append_csv_row(out_csv, row)
     print(f"[{suite_name}][seed={seed}][hz={target_hz}] "
-          f"success={rate:.1f}% ({success}/{total})  LDLJ={mean_ldlj:.3f}  JerkRMS={mean_jerk:.5f}")
-    return rate, mean_ldlj, mean_jerk
+          f"success_raw={rate_raw:.1f}% success_adjusted={rate_adjusted:.1f}% "
+          f"({success_raw}/{total} vs {success_adjusted}/{total})  "
+          f"LDLJ={mean_ldlj:.3f}  JerkRMS={mean_jerk:.5f}")
+    return {"rate_raw": rate_raw, "rate_adjusted": rate_adjusted,
+           "mean_ldlj": mean_ldlj, "mean_jerk": mean_jerk,
+           "energy_per_success_j_direct": energy_per_success_j_direct,
+           # merge_results.py의 latency_consistency_check가 트랙2 latency를 읽어올 수 있도록
+           # summary_csv에도 실어보낸다(out_csv에만 있으면 --success 기본값인 success_summary.csv
+           # 기준 merge에서는 항상 데이터가 없어 "NA"만 나오게 된다).
+           "server_infer_ms_mean": stats["server_infer_ms_mean"],
+           "rtt_ms_mean": stats["rtt_ms_mean"]}
 
 
 def run_suite_multiseed(policy, suite_name, n_tasks, episodes, seeds, out_csv,
                         artifact, target_hz=None, summary_csv=None):
     """
-    같은 suite를 여러 seed로 반복해 success_rate의 평균/표준편차/95% CI를 낸다(확정: 3 seed 기본).
+    같은 suite를 여러 seed로 반복해 success_rate(raw/adjusted 각각)의
+    평균/표준편차/95% CI를 낸다(확정: 3 seed 기본).
     """
-    rates = []
+    rates_raw, rates_adjusted, energy_per_success_vals = [], [], []
+    infer_ms_vals, rtt_ms_vals = [], []
     for seed in seeds:
-        rate, _, _ = run_suite_once(policy, suite_name, n_tasks, episodes, seed,
-                                    out_csv, artifact, target_hz)
-        rates.append(rate)
+        res = run_suite_once(policy, suite_name, n_tasks, episodes, seed,
+                             out_csv, artifact, target_hz)
+        rates_raw.append(res["rate_raw"])
+        rates_adjusted.append(res["rate_adjusted"])
+        if res["energy_per_success_j_direct"] != "NA":
+            energy_per_success_vals.append(res["energy_per_success_j_direct"])
+        if not np.isnan(res["server_infer_ms_mean"]):
+            infer_ms_vals.append(res["server_infer_ms_mean"])
+        if not np.isnan(res["rtt_ms_mean"]):
+            rtt_ms_vals.append(res["rtt_ms_mean"])
 
-    agg = agg_seed_runs(rates)
-    print(f"[{suite_name}][hz={target_hz}] === {agg['n_seeds']}-seed 집계 === "
-          f"mean={agg['mean']}%  std={agg['std']}  95%CI=[{agg['ci95_low']}, {agg['ci95_high']}]")
+    agg_raw = agg_seed_runs(rates_raw)
+    agg_adjusted = agg_seed_runs(rates_adjusted)
+    print(f"[{suite_name}][hz={target_hz}] === {agg_raw['n_seeds']}-seed 집계 === "
+          f"raw: mean={agg_raw['mean']}% std={agg_raw['std']} "
+          f"95%CI=[{agg_raw['ci95_low']}, {agg_raw['ci95_high']}]  |  "
+          f"adjusted: mean={agg_adjusted['mean']}% std={agg_adjusted['std']} "
+          f"95%CI=[{agg_adjusted['ci95_low']}, {agg_adjusted['ci95_high']}]")
 
     if summary_csv:
         row = {"name": artifact, "suite": suite_name,
                "target_hz": target_hz if target_hz else "NA",
-               "n_seeds": agg["n_seeds"], "mean_success_pct": agg["mean"],
-               "std": agg["std"], "ci95_low": agg["ci95_low"], "ci95_high": agg["ci95_high"],
-               "seed_values": str(agg["values"])}
+               "n_seeds": agg_raw["n_seeds"],
+               # 하위 호환 alias: 기존 소비자(merge_results.py 등)는 raw 값을 그대로 읽는다.
+               "mean_success_pct": agg_raw["mean"], "std": agg_raw["std"],
+               "ci95_low": agg_raw["ci95_low"], "ci95_high": agg_raw["ci95_high"],
+               "seed_values": str(agg_raw["values"]),
+               "mean_success_pct_raw": agg_raw["mean"], "std_raw": agg_raw["std"],
+               "ci95_low_raw": agg_raw["ci95_low"], "ci95_high_raw": agg_raw["ci95_high"],
+               "seed_values_raw": str(agg_raw["values"]),
+               "mean_success_pct_adjusted": agg_adjusted["mean"], "std_adjusted": agg_adjusted["std"],
+               "ci95_low_adjusted": agg_adjusted["ci95_low"], "ci95_high_adjusted": agg_adjusted["ci95_high"],
+               "seed_values_adjusted": str(agg_adjusted["values"]),
+               # 트랙2 직접실측 energy_per_success(J). seed마다 에너지 측정이 있었을 때만 평균한다
+               # — merge_results.py가 트랙1 근사치(energy_per_success_j)와 나란히 비교하는 데 쓴다.
+               "energy_per_success_j_direct": (
+                   round(float(np.mean(energy_per_success_vals)), 4)
+                   if energy_per_success_vals else "NA"
+               ),
+               # merge_results.py의 latency_consistency_check(트랙1 vs 트랙2)가 읽는 컬럼.
+               "server_infer_ms_mean": (
+                   round(float(np.mean(infer_ms_vals)), 4) if infer_ms_vals else "NA"
+               ),
+               "rtt_ms_mean": round(float(np.mean(rtt_ms_vals)), 4) if rtt_ms_vals else "NA"}
         append_csv_row(summary_csv, row)
-    return agg
+    return {"raw": agg_raw, "adjusted": agg_adjusted}
 
 
 def run_all_suites(policy, suites, n_tasks, episodes, seeds, out_csv, summary_csv,

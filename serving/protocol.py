@@ -10,7 +10,10 @@ host(시뮬) ↔ Jetson(모델) 간 관측/행동 직렬화.
 메시지 규약
   요청(obs) : {"image": HxWx3 uint8, "image2": ...|None, "state": np.ndarray|None,
                "instruction": str}
-  응답(act) : {"action": np.ndarray, "infer_ms": float}
+  응답(act) : {"action": np.ndarray, "infer_ms": float, "infer_energy_j": float|None}
+    - infer_energy_j: 이 predict() 호출 구간 동안 서버가 sysfs로 직접 잰 에너지(J).
+      측정을 지원하지 않는 서버(예: energy=False로 기동)는 None을 보낸다 — 하위 호환을 위해
+      선택 필드로 둔다.
 """
 
 import pickle
