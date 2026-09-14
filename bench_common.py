@@ -188,6 +188,17 @@ def run_all(specs, only=None) -> None:
             print(f"[error] artifact 실패({spec.name}): {e}")
 
 
+def filter_specs(specs, only=None):
+    """
+    --only 인자로 받은 키워드 목록에 맞춰 ArtifactSpec 목록을 걸러낸다.
+    bench_openvla.py/bench_smolvla.py의 __main__이 공통으로 쓰던 인라인 필터링을
+    여기로 옮겨 중복을 없앴다. only가 비어있으면(None/빈 리스트) 전체를 그대로 반환한다.
+    """
+    if not only:
+        return list(specs)
+    return [s for s in specs if any(k in (s.name or "") for k in only)]
+
+
 # ---------------------------------------------------------------------------
 # 스크리닝: open-loop MSE (시뮬 불필요)
 # ---------------------------------------------------------------------------
