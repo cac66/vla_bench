@@ -18,7 +18,7 @@ import gc
 import os
 import csv
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Any
 
 import torch
@@ -50,16 +50,16 @@ class ArtifactSpec:
 
     # --- 실행 콜백 ---
     # load_model() -> (model, extras: dict)
-    load_model: Optional[Callable[[], tuple]] = None
+    load_model: Callable[[], tuple] = None
     # build_inputs(model, extras) -> (inputs, seq_len:int, infer_fn)
     #   infer_fn(model, inputs, extras) -> Any
-    build_inputs: Optional[Callable[[Any, dict], tuple]] = None
+    build_inputs: Callable[[Any, dict], tuple] = None
     # 선택: breakdown(model, inputs, extras) -> dict(vision_ms, backbone_ms, action_ms)
     breakdown_fn: Optional[Callable[[Any, Any, dict], dict]] = None
     # 선택: accuracy() -> dict(success_rate_pct, action_mse, eval_env)
     accuracy_fn: Optional[Callable[[], dict]] = None
 
-    name: str = ""
+    name: str = field(default="")
 
 
 # ---------------------------------------------------------------------------
@@ -104,9 +104,10 @@ def run_artifact(spec: ArtifactSpec) -> None:
     label = spec.name or f"{spec.model}-{spec.precision}-{spec.technique}"
 
     # ① idle-baseline: 모델을 올리기 전에 측정해야 "이 artifact 로딩·추론이 추가로 쓴" 전력을 분리할 수 있다.
-    idle_baseline_w = 0.0
+    # [정정] AGX Orin은 단일 VDD_IN 채널이 없어 compute(1+2)/total(1+2+3) 두 값을 dict로 받는다.
+    idle_baseline = {"compute": 0.0, "total": 0.0}
     if spec.measure_energy:
-        idle_baseline_w = measure_idle_baseline(duration_s=spec.idle_baseline_s)
+        idle_baseline = measure_idle_baseline(duration_s=spec.idle_baseline_s)
 
     print(f"\n=== [{label}] 로딩 ===")
     model, extras = spec.load_model()
@@ -162,30 +163,25 @@ def run_artifact(spec: ArtifactSpec) -> None:
                 print(f"[warn] accuracy 기록 실패({label}): {e}")
 
     # ⑤~⑥ 에너지 요약 계산 및 별도 CSV 기록 (성능 CSV는 TegraProfiler가 이미 저장)
+    # [정정] compute(GPU+CPU)와 total(+시스템 5V) 두 지표를 한 행에 함께 기록한다.
     if energy_sampler is not None:
-        summary = energy_summary(energy_sampler, idle_baseline_w, spec.measure_iters)
+        summary = energy_summary(energy_sampler, idle_baseline, spec.measure_iters)
         row = {"name": spec.name, "device": spec.device, "model": spec.model,
                "precision": spec.precision, "technique": spec.technique,
                "measure_iters": spec.measure_iters, **summary}
         append_csv_row(f"{spec.out_root}/energy.csv", row)
-        print(f"[energy] {label}: net={summary['net_power_w']}W  "
-              f"{summary['energy_mj_per_action']}mJ/action")
+        print(f"[energy] {label}: "
+              f"compute net={summary['net_power_w_compute']}W/{summary['energy_mj_per_action_compute']}mJ  "
+              f"total net={summary['net_power_w_total']}W/{summary['energy_mj_per_action_total']}mJ")
 
     free_model(model)
     print(f"=== [{label}] 완료 → {spec.out_root} ===")
 
 
-def filter_specs(specs, only=None) -> list:
-    """--only 필터: 이름에 지정된 키워드 중 하나라도 포함된 spec만 남긴다.
-    (bench_openvla.py / bench_smolvla.py CLI가 공통으로 사용)
-    """
-    if not only:
-        return list(specs)
-    return [s for s in specs if any(k in (s.name or "") for k in only)]
-
-
 def run_all(specs, only=None) -> None:
-    for spec in filter_specs(specs, only):
+    for spec in specs:
+        if only and not any(k in (spec.name or "") for k in only):
+            continue
         try:
             run_artifact(spec)
         except Exception as e:

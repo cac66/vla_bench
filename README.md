@@ -4,7 +4,7 @@ Jetson(모델) + host(시뮬) 구성에서 OpenVLA·SmolVLA artifact를 측정�
 
 ## 개정 사항 (measurement_extension_spec.md 반영)
 
-- **Energy**: `energy.py` — sysfs(`/sys/class/hwmon/hwmon1`, VDD_IN 레일) 직접 폴링. power 노드가 없어 전압×전류로 계산. idle-baseline(30s) 차감한 순수 에너지 + 총 에너지 둘 다 산출, `mJ/action`으로 정규화. `bench_common.run_artifact`가 측정 구간에 자동 연동.
+- **Energy**: `energy.py` — sysfs(`/sys/class/hwmon/hwmon1`, GPU_SOC/CPU_CV/VIN_SYS_5V0 레일) 직접 폴링. AGX Orin에는 VDD_IN 채널이 없어 **compute(GPU+CPU)·total(+시스템5V) 두 지표**를 함께 산출. power 노드가 없어 전압×전류로 계산. idle-baseline(30s) 차감한 순수 에너지 + 총 에너지 둘 다 산출, `mJ/action`으로 정규화. `bench_common.run_artifact`가 측정 구간에 자동 연동.
 - **Suite별 성공률 분해**: `run_libero_remote.run_all_suites` — 여러 suite를 순회해 결과를 나란히 기록.
 - **Action smoothness**: `smoothness.py` — LDLJ + JerkRMS 2종(확정), 성공 episode만 계산.
 - **제어주파수-성공률 곡선**: `run_libero_remote.py --target-hz-sweep` — 30/15/10/6/3 Hz로 인위적 지연 주입.

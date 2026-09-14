@@ -21,9 +21,9 @@ from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConf
 
 from bench_common import ArtifactSpec, run_all, screen_mse, filter_specs, SubmoduleTimer
 
-CKPT = "openvla/openvla-7b-finetuned-libero-spatial"   # suite에 맞게 교체
-AWQ_CKPT = "./ckpts/openvla-libero-spatial-awq"
-UNNORM_KEY = "libero_spatial_no_noops"
+CKPT = "/workspace/ckpts/openvla-libero-spatial"
+AWQ_CKPT = "/workspace/ckpts/openvla-libero-spatial-awq"
+UNNORM_KEY = "libero_spatial"
 DEVICE = "cuda:0"
 DTYPE = torch.bfloat16
 PROMPT_TMPL = "In: What action should the robot take to {instr}?\nOut:"
