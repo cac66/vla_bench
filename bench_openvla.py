@@ -30,15 +30,17 @@ PROMPT_TMPL = "In: What action should the robot take to {instr}?\nOut:"
 
 
 # --- 공유 전처리 / 추론 -------------------------------------------------------
+
 def preprocess_openvla(extras, obs_dict):
-    """obs_dict = {"image": HxWx3 uint8, "instruction": str} → 모델 입력."""
     proc = extras["processor"]
     img = obs_dict["image"]
     if not isinstance(img, Image.Image):
         img = Image.fromarray(np.asarray(img, dtype=np.uint8))
     prompt = PROMPT_TMPL.format(instr=obs_dict.get("instruction", "pick up the object"))
     inputs = proc(prompt, img)
-    inputs = {k: (v.to(DEVICE, dtype=DTYPE) if torch.is_floating_point(v) else v.to(DEVICE))
+    # 입력 dtype을 하드코딩된 DTYPE이 아니라, extras에 전달된 실제 모델 dtype에 맞춘다.
+    input_dtype = extras.get("input_dtype", DTYPE)
+    inputs = {k: (v.to(DEVICE, dtype=input_dtype) if torch.is_floating_point(v) else v.to(DEVICE))
               for k, v in inputs.items()}
     return inputs
 
@@ -78,22 +80,27 @@ def load_fp16():
     ).to(DEVICE).eval()
     return model, {"processor": _proc()}
 
-
 def load_int8_bnb():
     bnb = BitsAndBytesConfig(load_in_8bit=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        CKPT, trust_remote_code=True, torch_dtype=DTYPE,
-        quantization_config=bnb, device_map={"": 0}, low_cpu_mem_usage=True).eval()
-    return model, {"processor": _proc()}
-
+    with torch.device("cuda"):
+        model = AutoModelForVision2Seq.from_pretrained(
+            CKPT, trust_remote_code=True, quantization_config=bnb, device_map=None,
+        )
+    model.eval()
+    # 실제 vision backbone dtype을 찾아 extras에 기록
+    actual_dtype = next(p.dtype for n, p in model.named_parameters() if "vision" in n or "featurizer" in n)
+    return model, {"processor": _proc(), "input_dtype": actual_dtype}
 
 def load_int4_bnb():
-    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                             bnb_4bit_compute_dtype=DTYPE, bnb_4bit_use_double_quant=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        CKPT, trust_remote_code=True, torch_dtype=DTYPE,
-        quantization_config=bnb, device_map={"": 0}, low_cpu_mem_usage=True).eval()
-    return model, {"processor": _proc()}
+    bnb = BitsAndBytesConfig(load_in_4bit=True)
+    with torch.device("cuda"):
+        model = AutoModelForVision2Seq.from_pretrained(
+            CKPT, trust_remote_code=True, quantization_config=bnb, device_map=None,
+        )
+    model.eval()
+    # 실제 vision backbone dtype을 찾아 extras에 기록
+    actual_dtype = next(p.dtype for n, p in model.named_parameters() if "vision" in n or "featurizer" in n)
+    return model, {"processor": _proc(), "input_dtype": actual_dtype}
 
 
 def load_awq():
