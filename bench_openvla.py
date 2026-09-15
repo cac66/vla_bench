@@ -12,6 +12,12 @@ artifact ↔ 메타데이터
   A0 fp16/pytorch/none  | A1 int8/pytorch/none(bnb 8bit) | A2 int4/pytorch/none(bnb nf4)
   A3 int4/pytorch/awq   | A4 int4/pytorch/torch_compile  | A5 fp16/pytorch/token_prune
 """
+import transformers.modeling_utils as _mu
+_original_dispatch_model = _mu.dispatch_model
+def _dispatch_model_noop(model, **kwargs):
+    return model
+_mu.dispatch_model = _dispatch_model_noop
+
 
 import argparse
 import numpy as np
@@ -92,16 +98,19 @@ def load_int8_bnb():
     return model, {"processor": _proc(), "input_dtype": actual_dtype}
 
 def load_int4_bnb():
-    bnb = BitsAndBytesConfig(load_in_4bit=True)
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,   # ← 명시적으로 지정 (기본값 fp32 방지)
+        bnb_4bit_use_double_quant=True,
+    )
     with torch.device("cuda"):
         model = AutoModelForVision2Seq.from_pretrained(
             CKPT, trust_remote_code=True, quantization_config=bnb, device_map=None,
         )
     model.eval()
-    # 실제 vision backbone dtype을 찾아 extras에 기록
     actual_dtype = next(p.dtype for n, p in model.named_parameters() if "vision" in n or "featurizer" in n)
     return model, {"processor": _proc(), "input_dtype": actual_dtype}
-
 
 def load_awq():
     model = AutoModelForVision2Seq.from_pretrained(
