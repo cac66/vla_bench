@@ -18,7 +18,10 @@ import argparse
 import sys
 
 import torch
+import os
 
+# tools/ 안에서 실행해도 상위 폴더(vla_bench/)의 bench_openvla.py를 찾도록 경로 추가.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # bitsandbytes의 실제 Linear 클래스. 없으면 quant 레이어 판별이 불가하므로 명확히 알림.
 try:
     import bitsandbytes as bnb

@@ -1,0 +1,8 @@
+name,device,model,precision,technique,n_samples,mse_vs_fp16,mse_vs_gt
+A0_fp16,agx_orin_64gb,openvla,fp16,none,200,0.0,NA
+A1_int8,agx_orin_64gb,openvla,int8,none,200,0.029996249824762344,NA
+A2_int4,agx_orin_64gb,openvla,int4,none,200,0.054864075034856796,NA
+A0_fp16,agx_orin_64gb,openvla,fp16,none,200,0.0,NA
+A1_int8,agx_orin_64gb,openvla,int8,none,200,0.029996249824762344,NA
+A1b_int8_nooutlier,agx_orin_64gb,openvla,int8,no_outlier,200,0.03722400218248367,NA
+A2_int4,agx_orin_64gb,openvla,int4,none,200,0.054864075034856796,NA
