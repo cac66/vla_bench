@@ -1,0 +1,4 @@
+name,device,model,precision,technique,measure_iters,idle_power_w_compute,active_power_w_compute,net_power_w_compute,energy_j_total_compute,energy_j_net_compute,energy_mj_per_action_compute,idle_power_w_total,active_power_w_total,net_power_w_total,energy_j_total_total,energy_j_net_total,energy_mj_per_action_total
+A0_fp16,agx_orin_64gb,openvla,fp16,none,200,3.6134,31.2481,27.6347,5427.8416,4800.5087,24002.5434,7.8471,42.4994,34.6524,7382.2562,6019.5729,30097.8647
+A1_int8,agx_orin_64gb,openvla,int8,none,200,3.6192,10.0241,6.4049,5615.5434,3588.3061,17941.5305,7.9662,16.8952,8.929,9465.0304,5002.4361,25012.1807
+A2_int4,agx_orin_64gb,openvla,int4,none,200,3.6177,24.398,20.7803,7176.2726,6118.194,30590.9701,7.8708,32.7612,24.8904,9637.2555,7328.2811,36641.4054
