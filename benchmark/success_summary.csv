@@ -1,0 +1,2 @@
+name,suite,target_hz,n_seeds,mean_success_pct,std,ci95_low,ci95_high,seed_values,mean_success_pct_raw,std_raw,ci95_low_raw,ci95_high_raw,seed_values_raw,mean_success_pct_adjusted,std_adjusted,ci95_low_adjusted,ci95_high_adjusted,seed_values_adjusted,energy_per_success_j_direct,server_infer_ms_mean,rtt_ms_mean
+A0_fp16,libero_spatial,NA,1,0.0,0.0,0.0,0.0,[0.0],0.0,0.0,0.0,0.0,[0.0],0.0,0.0,0.0,0.0,[0.0],NA,880.9597,918.0044

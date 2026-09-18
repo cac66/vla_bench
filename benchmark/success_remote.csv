@@ -1,0 +1,2 @@
+name,suite,seed,target_hz,episodes,success,success_rate_pct,success_raw,success_rate_pct_raw,success_adjusted,success_rate_pct_adjusted,smoothness_ldlj_mean,smoothness_jerkrms_mean,n_success_episodes_for_smoothness,energy_per_success_j_direct,n_success_episodes_for_energy,network_overhead_ms_mean,rtt_ms_mean,server_infer_ms_mean,total_energy_j_mean,n_calls
+A0_fp16,libero_spatial,0,NA,2,0,0.0,0,0.0,0,0.0,NA,NA,0,NA,0,37.0448,918.0044290749742,880.9596599588986,nan,440

@@ -8,12 +8,7 @@ LIBERO closed-loop rollout을 돌리되, 정책 추론은 Jetson 서버(RemotePo
   - suite별 성공률 분해: 여러 suite를 한 번에 순회해 결과를 나란히 CSV에 쌓는다.
   - action smoothness(LDLJ+JerkRMS): 성공 episode의 action 시퀀스만 계산.
   - 제어주파수-성공률 곡선: --target-hz 로 인위적 지연을 주입해 스윕.
-    → raw(실측 RTT 기준)와 adjusted(서버 infer_ms만 기준, 네트워크 시간 제외) 두 곡선을
-      동시에 산출한다. RemotePolicy가 왕복(net)과 서버측 순수 추론(infer)을 분리 로깅하므로
-      가능해졌다 — 자세한 배경은 run_episode()/run_suite_once() docstring 참조.
-  - success rate 통계: --seeds 로 3회(기본) 반복 후 평균/표준편차/95% CI 보고(raw/adjusted 각각).
-  - episode 직접실측 에너지: 서버가 --measure-energy로 predict() 호출별 에너지를 함께 보내면,
-    성공 episode들의 총 에너지 평균을 energy_per_success_j_direct로 CSV에 남긴다.
+  - success rate 통계: --seeds 로 3회(기본) 반복 후 평균/표준편차/95% CI 보고.
 
 실행 예)
   # 기본(단일 suite, 3 seed, 지연 없음)
@@ -82,24 +77,80 @@ def obs_to_dict(obs, instruction):
     }
 
 
+def _safe_filename(text: str, maxlen: int = 40) -> str:
+    """instruction 문자열을 파일명으로 써도 안전하게 정리한다(공백/특수문자 처리)."""
+    keep = "".join(c if c.isalnum() or c in " _-" else "_" for c in text)
+    keep = "_".join(keep.split())
+    return (keep[:maxlen] or "task")
+
+
+def save_video(frames, path: str, fps: int = 10) -> bool:
+    """
+    프레임 리스트를 mp4로 저장한다. imageio가 없으면 건너뛰고 설치 안내만 출력한다
+    (영상 저장 실패로 측정 자체가 죽으면 안 되므로 예외를 여기서 흡수한다).
+    """
+    if not frames:
+        return False
+    try:
+        import imageio
+    except ImportError:
+        print("[record] imageio가 설치돼 있지 않아 영상 저장을 건너뜀. "
+              "설치: pip install imageio imageio-ffmpeg")
+        return False
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        imageio.mimsave(path, frames, fps=fps)
+        return True
+    except Exception as e:
+        print(f"[record] 영상 저장 실패({path}): {e}")
+        return False
+
+
+def _write_live_view(path: str, image: np.ndarray, text_path: str = None, text: str = None) -> None:
+    """
+    현재 프레임을 하나의 이미지 파일로 계속 덮어쓴다(진짜 동영상 창이 아니라,
+    "새로고침하면 최신 화면이 보이는" 방식 — headless(EGL) 환경에서 유일하게
+    안정적으로 되는 실시간 확인 방법이다).
+    text/text_path를 주면 지금 어떤 task를 수행 중인지 별도 텍스트 파일로도 남긴다.
+    """
+    try:
+        import imageio
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        imageio.imwrite(path, image)
+        if text_path and text is not None:
+            with open(text_path, "w") as f:
+                f.write(text)
+    except Exception:
+        pass  # 실시간 뷰는 실패해도 측정 자체를 막으면 안 된다
+
+
 def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
-                delay_basis="rtt"):
+                progress_prefix="", step_log_every=20, record=False,
+                live_view_path=None, live_view_every=1):
     """
     한 episode를 closed-loop으로 실행한다.
-    target_hz가 주어지면 매 step 후 지연을 주입해 제어주파수를 강제하되,
-    무엇을 "이 step이 예산을 넘겼는가"의 기준으로 쓸지는 delay_basis가 결정한다.
-      - "rtt"  : 실측 왕복시간(policy.predict() 호출의 네트워크+추론) 기준 — 곡선 A(raw).
-                 실제 decoupled 배포에서 체감하는 제어주파수를 재현한다.
-      - "infer": 서버가 보고한 순수 추론시간(policy.last_infer_ms) 기준 — 곡선 B(adjusted).
-                 네트워크 왕복을 뺀, "순수 on-device였다면"을 재해석한 판정이다.
-    반환: dict(success: bool, action_seq: np.ndarray [T, action_dim], energy_j: float|None)
-      energy_j는 이 episode 동안 서버가 실측한 에너지 총합(predict() 호출별 infer_energy_j의 합).
-      서버가 에너지 측정을 지원하지 않으면(--measure-energy 미지정) None.
+    target_hz가 주어지면 매 step 후 (1/target_hz - 실제소요) 만큼 sleep해 제어주파수를 강제한다.
+    반환: (success: bool, action_seq: np.ndarray [T, action_dim], frames: list|None)
 
-    주의(수정): 사설 메서드 env._get_observations()를 쓰지 않는다. LIBERO/robosuite
+    [신규] record=True면 매 step의 agentview_image를 frames 리스트에 모아 반환한다.
+    실제로 파일로 저장할지는 호출자(run_suite_once)가 정책(주기적/실패시 등)에 따라
+    결정한다 — 여기서는 "모으기만" 하고 "저장 여부 판단"은 분리했다.
+
+    [신규] live_view_path를 주면, live_view_every step마다 현재 화면을 그 경로에
+    계속 덮어쓴다("live_view.jpg"를 이미지 뷰어로 열어두고 자동새로고침 설정하면
+    실시간에 가깝게 볼 수 있다). record(영상 파일 저장)와는 목적이 다르다:
+    - record: 나중에 다시 보기 위해 저장(선택적, 주기/실패시)
+    - live_view: 지금 이 순간 진행 상황을 눈으로 확인하기 위한 것(항상 켜도 오버헤드 작음)
+
+    [신규] progress_prefix/step_log_every: 진행 상황을 step 단위로도 출력한다.
+    - 긴 episode(최대 520 step인 suite도 있음) 도중 화면이 몇 분씩 조용해지는 걸 막는다.
+    - 만약 policy.predict()가 예외(예: zmq timeout)를 던지면, "정확히 몇 번째 step에서
+      멈췄는지"를 출력하고 다시 던진다 — 이후 같은 문제가 재발해도 원인 위치를 바로
+      알 수 있게 하기 위함이다(이전에 겪은 timeout 사고에서 이 정보가 없어 어려웠다).
+
+    주의(기존): 사설 메서드 env._get_observations()를 쓰지 않는다. LIBERO/robosuite
     버전에 따라 존재 여부·래핑 구조(env vs env.env)가 달라 깨지기 쉽기 때문이다.
-    대신 공개 API인 reset()/set_init_state()/step()의 "반환값"만으로 obs를 이어간다
-    — 스모크 테스트에서 이미 env.step()이 완전한 obs dict를 준다는 걸 확인했다.
+    대신 공개 API인 reset()/set_init_state()/step()의 "반환값"만으로 obs를 이어간다.
     """
     reset_obs = env.reset()
     init_obs = env.set_init_state(init_state)
@@ -108,195 +159,188 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
 
     done = False
     actions = []
-    energy_total = 0.0
-    energy_recorded = False
+    frames = [] if record else None
+    ep_t0 = time.perf_counter()
+    live_text_path = (os.path.splitext(live_view_path)[0] + ".txt") if live_view_path else None
 
-    for _ in range(max_steps):
+    for step_i in range(max_steps):
+        if record:
+            frames.append(np.asarray(obs["agentview_image"], dtype=np.uint8))
+
+        if live_view_path and (step_i % live_view_every == 0):
+            status = (f"{progress_prefix}\ninstruction: {instruction}\n"
+                     f"step: {step_i+1}/{max_steps}")
+            _write_live_view(live_view_path, obs["agentview_image"], live_text_path, status)
+
         t0 = time.perf_counter()
-        action = policy.predict(obs_to_dict(obs, instruction))
+        try:
+            action = policy.predict(obs_to_dict(obs, instruction))
+        except Exception as e:
+            elapsed_ep = time.perf_counter() - ep_t0
+            print(f"{progress_prefix} [에러] step {step_i+1}/{max_steps}에서 정책 호출 실패 "
+                  f"(episode 경과 {elapsed_ep:.1f}s): {e}")
+            raise
         elapsed = time.perf_counter() - t0
-
-        e = policy.last_energy_j
-        if e is not None:
-            energy_total += e
-            energy_recorded = True
 
         actions.append(np.asarray(action, dtype=np.float32))
         obs, reward, done, info = env.step(action.tolist())  # 다음 루프의 obs를 여기서 확보
 
         if target_hz:
             budget = 1.0 / target_hz
-            basis_elapsed = elapsed if delay_basis == "rtt" else (policy.last_infer_ms / 1000.0)
-            if basis_elapsed < budget:
-                time.sleep(budget - basis_elapsed)
+            if elapsed < budget:
+                time.sleep(budget - elapsed)
+
+        if step_log_every and (step_i + 1) % step_log_every == 0 and not done:
+            print(f"{progress_prefix}   step {step_i+1}/{max_steps} 진행 중 "
+                  f"(episode 경과 {time.perf_counter()-ep_t0:.1f}s, "
+                  f"최근 predict {elapsed*1000:.0f}ms)")
 
         if done:
             break
 
     action_seq = np.stack(actions) if actions else np.zeros((0, 7), np.float32)
-    return {"success": bool(done), "action_seq": action_seq,
-            "energy_j": energy_total if energy_recorded else None}
+    return bool(done), action_seq, frames
 
 
 def run_suite_once(policy, suite_name, n_tasks, episodes, seed, out_csv,
-                   artifact, target_hz=None):
+                   artifact, target_hz=None, step_log_every=20,
+                   record_every=0, record_failures=False, record_dir="./benchmark/videos",
+                   live_view_path=None, live_view_every=1):
     """
-    한 suite를 한 seed로 1회 실행. 성공률(raw/adjusted 두 계열) + smoothness(성공 episode 평균)
-    + episode 직접실측 에너지를 반환한다.
+    한 suite를 한 seed로 1회 실행. 성공률 + smoothness(성공 episode 평균)를 반환.
     seed는 에피소드 서브샘플링(초기상태 셔플)에 사용해 실행 간 변동을 만든다.
 
-    raw vs adjusted (구현 방식: 독립 rollout — 정확도 우선):
-      target_hz가 주어지면 같은 (task, init_state)를 raw 기준(elapsed=RTT)과 adjusted
-      기준(elapsed=서버 infer_ms) 각각으로 "독립적으로" 두 번 굴린다. 지연 주입 위치가
-      다르면 이후 물리 시뮬레이션 진행이 달라져(action이 늦게 나갈수록 env가 그만큼
-      "밀린" 상태에서 다음 obs를 받음) 같은 rollout에서 두 판정을 동시에 내는 방식은
-      정확하지 않기 때문이다. target_hz가 없으면(지연 주입 자체가 없으므로) 두 기준이
-      물리적으로 동일한 rollout이 되어 raw 결과를 그대로 재사용하고 두 번째 rollout은
-      건너뛴다(불필요한 비용 절감).
+    [신규] episode 하나가 끝날 때마다 진행 로그를 남긴다(누적 성공률, 총 경과 시간,
+    "몇 번째 episode인지"). 기존엔 suite 전체(수십 episode)가 끝나야 첫 출력이 나와
+    16분씩 화면이 조용했던 문제를 해결한다.
+
+    [신규] task마다 자연어 instruction을 출력한다 — "task 3/10"처럼 번호로만 아는 게
+    아니라, 정확히 어떤 지시문("pick up the black bowl...")인지 그대로 보여준다.
+
+    [신규] record_every>0이면 N번째 episode마다, record_failures=True면 실패한 episode마다
+    영상을 저장한다(둘 다 꺼져 있으면 프레임을 아예 안 모아 오버헤드 없음). 파일명에
+    artifact·suite·seed·task·instruction·성공여부를 담아, 나중에 "어떤 상황에서 실패했는지"
+    파일명만 보고도 알 수 있게 한다.
+
+    [신규] live_view_path를 주면 실행 내내 그 경로의 이미지 파일이 계속 최신 화면으로
+    갱신된다(headless 환경에서의 "실시간 보기"). 옆에 같은 이름의 .txt 파일에는 지금
+    수행 중인 instruction·진행 step이 함께 기록된다.
     """
     rng = np.random.RandomState(seed)
     max_steps = MAX_STEPS.get(suite_name, 300)
-    total, success_raw, success_adjusted = 0, 0, 0
+    total, success = 0, 0
     ldlj_list, jerkrms_list = [], []
-    success_energy_list = []  # raw rollout 기준, 성공 episode들의 실측 총 에너지(J)
+    suite_t0 = time.perf_counter()
+    want_record = bool(record_every) or record_failures  # 이게 꺼져있으면 프레임 수집 자체를 생략
 
     dt = 1.0 / target_hz if target_hz else 1.0  # smoothness 계산용 시간 스케일
 
     for task_id in range(n_tasks):
         env, init_states, instruction = make_env(suite_name, task_id)
+        print(f"[{suite_name}] task {task_id+1}/{n_tasks} instruction: \"{instruction}\"")
         order = rng.permutation(len(init_states))[:min(episodes, len(init_states))]
-        for idx in order:
-            res_raw = run_episode(policy, env, init_states[idx], instruction,
-                                  max_steps, target_hz, delay_basis="rtt")
+        n_this_task = len(order)
+
+        for ep_i, idx in enumerate(order):
+            prefix = (f"[{suite_name}][seed={seed}]"
+                     f"[task {task_id+1}/{n_tasks}][ep {ep_i+1}/{n_this_task}]")
+            ep_t0 = time.perf_counter()
+
+            ok, action_seq, frames = run_episode(
+                policy, env, init_states[idx], instruction, max_steps, target_hz,
+                progress_prefix=prefix, step_log_every=step_log_every, record=want_record,
+                live_view_path=live_view_path, live_view_every=live_view_every)
+
+            ep_dt = time.perf_counter() - ep_t0
             total += 1
-            success_raw += int(res_raw["success"])
-            if res_raw["success"] and len(res_raw["action_seq"]) >= 5:
-                sm = compute_smoothness(res_raw["action_seq"], dt=dt, success=True)
+            success += int(ok)
+            running_rate = 100.0 * success / total
+            total_elapsed_min = (time.perf_counter() - suite_t0) / 60.0
+            print(f"{prefix} {'✓성공' if ok else '✗실패'} "
+                  f"({ep_dt:.1f}s, {len(action_seq)}step) | "
+                  f"누적 {success}/{total}({running_rate:.1f}%) | "
+                  f"총 경과 {total_elapsed_min:.1f}분")
+
+            # 저장 여부 판단: 주기적 샘플 또는 실패 episode
+            save_reason = []
+            if record_every and (ep_i + 1) % record_every == 0:
+                save_reason.append("periodic")
+            if record_failures and not ok:
+                save_reason.append("fail")
+            if save_reason and frames:
+                fname = (f"{artifact}_{suite_name}_seed{seed}_task{task_id}"
+                        f"_{_safe_filename(instruction)}_ep{ep_i+1}"
+                        f"_{'success' if ok else 'fail'}.mp4")
+                path = os.path.join(record_dir, fname)
+                if save_video(frames, path):
+                    print(f"{prefix} [record] 저장({'+'.join(save_reason)}): {path}")
+
+            if ok and len(action_seq) >= 5:
+                sm = compute_smoothness(action_seq, dt=dt, success=True)
                 if sm["smoothness_ldlj"] != "NA":
                     ldlj_list.append(sm["smoothness_ldlj"])
                 if sm["smoothness_jerkrms"] != "NA":
                     jerkrms_list.append(sm["smoothness_jerkrms"])
-            if res_raw["success"] and res_raw["energy_j"] is not None:
-                success_energy_list.append(res_raw["energy_j"])
-
-            if target_hz:
-                res_adj = run_episode(policy, env, init_states[idx], instruction,
-                                      max_steps, target_hz, delay_basis="infer")
-                success_adjusted += int(res_adj["success"])
-            else:
-                success_adjusted += int(res_raw["success"])
         env.close()
 
-    rate_raw = 100.0 * success_raw / max(total, 1)
-    rate_adjusted = 100.0 * success_adjusted / max(total, 1)
+    rate = 100.0 * success / max(total, 1)
     mean_ldlj = float(np.mean(ldlj_list)) if ldlj_list else float("nan")
     mean_jerk = float(np.mean(jerkrms_list)) if jerkrms_list else float("nan")
-    energy_per_success_j_direct = (
-        round(float(np.mean(success_energy_list)), 4) if success_energy_list else "NA"
-    )
-
-    stats = policy.stats()
-    network_overhead_ms_mean = (
-        stats["rtt_ms_mean"] - stats["server_infer_ms_mean"]
-        if not (np.isnan(stats["rtt_ms_mean"]) or np.isnan(stats["server_infer_ms_mean"]))
-        else float("nan")
-    )
 
     row = {"name": artifact, "suite": suite_name, "seed": seed,
            "target_hz": target_hz if target_hz else "NA",
-           "episodes": total,
-           "success": success_raw, "success_rate_pct": round(rate_raw, 2),  # 하위 호환 alias(raw)
-           "success_raw": success_raw, "success_rate_pct_raw": round(rate_raw, 2),
-           "success_adjusted": success_adjusted,
-           "success_rate_pct_adjusted": round(rate_adjusted, 2),
+           "episodes": total, "success": success, "success_rate_pct": round(rate, 2),
            "smoothness_ldlj_mean": round(mean_ldlj, 4) if not np.isnan(mean_ldlj) else "NA",
            "smoothness_jerkrms_mean": round(mean_jerk, 6) if not np.isnan(mean_jerk) else "NA",
            "n_success_episodes_for_smoothness": len(ldlj_list),
-           "energy_per_success_j_direct": energy_per_success_j_direct,
-           "n_success_episodes_for_energy": len(success_energy_list),
-           "network_overhead_ms_mean": round(network_overhead_ms_mean, 4)
-                                        if not np.isnan(network_overhead_ms_mean) else "NA",
-           **stats}
+           **policy.stats()}
     append_csv_row(out_csv, row)
     print(f"[{suite_name}][seed={seed}][hz={target_hz}] "
-          f"success_raw={rate_raw:.1f}% success_adjusted={rate_adjusted:.1f}% "
-          f"({success_raw}/{total} vs {success_adjusted}/{total})  "
-          f"LDLJ={mean_ldlj:.3f}  JerkRMS={mean_jerk:.5f}")
-    return {"rate_raw": rate_raw, "rate_adjusted": rate_adjusted,
-           "mean_ldlj": mean_ldlj, "mean_jerk": mean_jerk,
-           "energy_per_success_j_direct": energy_per_success_j_direct,
-           # merge_results.py의 latency_consistency_check가 트랙2 latency를 읽어올 수 있도록
-           # summary_csv에도 실어보낸다(out_csv에만 있으면 --success 기본값인 success_summary.csv
-           # 기준 merge에서는 항상 데이터가 없어 "NA"만 나오게 된다).
-           "server_infer_ms_mean": stats["server_infer_ms_mean"],
-           "rtt_ms_mean": stats["rtt_ms_mean"]}
+          f"success={rate:.1f}% ({success}/{total})  LDLJ={mean_ldlj:.3f}  JerkRMS={mean_jerk:.5f}")
+    return rate, mean_ldlj, mean_jerk
 
 
 def run_suite_multiseed(policy, suite_name, n_tasks, episodes, seeds, out_csv,
-                        artifact, target_hz=None, summary_csv=None):
+                        artifact, target_hz=None, summary_csv=None, step_log_every=20,
+                        record_every=0, record_failures=False, record_dir="./benchmark/videos",
+                        live_view_path=None, live_view_every=1):
     """
-    같은 suite를 여러 seed로 반복해 success_rate(raw/adjusted 각각)의
-    평균/표준편차/95% CI를 낸다(확정: 3 seed 기본).
+    같은 suite를 여러 seed로 반복해 success_rate의 평균/표준편차/95% CI를 낸다(확정: 3 seed 기본).
     """
-    rates_raw, rates_adjusted, energy_per_success_vals = [], [], []
-    infer_ms_vals, rtt_ms_vals = [], []
+    rates = []
     for seed in seeds:
-        res = run_suite_once(policy, suite_name, n_tasks, episodes, seed,
-                             out_csv, artifact, target_hz)
-        rates_raw.append(res["rate_raw"])
-        rates_adjusted.append(res["rate_adjusted"])
-        if res["energy_per_success_j_direct"] != "NA":
-            energy_per_success_vals.append(res["energy_per_success_j_direct"])
-        if not np.isnan(res["server_infer_ms_mean"]):
-            infer_ms_vals.append(res["server_infer_ms_mean"])
-        if not np.isnan(res["rtt_ms_mean"]):
-            rtt_ms_vals.append(res["rtt_ms_mean"])
+        rate, _, _ = run_suite_once(policy, suite_name, n_tasks, episodes, seed,
+                                    out_csv, artifact, target_hz, step_log_every,
+                                    record_every, record_failures, record_dir,
+                                    live_view_path, live_view_every)
+        rates.append(rate)
 
-    agg_raw = agg_seed_runs(rates_raw)
-    agg_adjusted = agg_seed_runs(rates_adjusted)
-    print(f"[{suite_name}][hz={target_hz}] === {agg_raw['n_seeds']}-seed 집계 === "
-          f"raw: mean={agg_raw['mean']}% std={agg_raw['std']} "
-          f"95%CI=[{agg_raw['ci95_low']}, {agg_raw['ci95_high']}]  |  "
-          f"adjusted: mean={agg_adjusted['mean']}% std={agg_adjusted['std']} "
-          f"95%CI=[{agg_adjusted['ci95_low']}, {agg_adjusted['ci95_high']}]")
+    agg = agg_seed_runs(rates)
+    print(f"[{suite_name}][hz={target_hz}] === {agg['n_seeds']}-seed 집계 === "
+          f"mean={agg['mean']}%  std={agg['std']}  95%CI=[{agg['ci95_low']}, {agg['ci95_high']}]")
 
     if summary_csv:
         row = {"name": artifact, "suite": suite_name,
                "target_hz": target_hz if target_hz else "NA",
-               "n_seeds": agg_raw["n_seeds"],
-               # 하위 호환 alias: 기존 소비자(merge_results.py 등)는 raw 값을 그대로 읽는다.
-               "mean_success_pct": agg_raw["mean"], "std": agg_raw["std"],
-               "ci95_low": agg_raw["ci95_low"], "ci95_high": agg_raw["ci95_high"],
-               "seed_values": str(agg_raw["values"]),
-               "mean_success_pct_raw": agg_raw["mean"], "std_raw": agg_raw["std"],
-               "ci95_low_raw": agg_raw["ci95_low"], "ci95_high_raw": agg_raw["ci95_high"],
-               "seed_values_raw": str(agg_raw["values"]),
-               "mean_success_pct_adjusted": agg_adjusted["mean"], "std_adjusted": agg_adjusted["std"],
-               "ci95_low_adjusted": agg_adjusted["ci95_low"], "ci95_high_adjusted": agg_adjusted["ci95_high"],
-               "seed_values_adjusted": str(agg_adjusted["values"]),
-               # 트랙2 직접실측 energy_per_success(J). seed마다 에너지 측정이 있었을 때만 평균한다
-               # — merge_results.py가 트랙1 근사치(energy_per_success_j)와 나란히 비교하는 데 쓴다.
-               "energy_per_success_j_direct": (
-                   round(float(np.mean(energy_per_success_vals)), 4)
-                   if energy_per_success_vals else "NA"
-               ),
-               # merge_results.py의 latency_consistency_check(트랙1 vs 트랙2)가 읽는 컬럼.
-               "server_infer_ms_mean": (
-                   round(float(np.mean(infer_ms_vals)), 4) if infer_ms_vals else "NA"
-               ),
-               "rtt_ms_mean": round(float(np.mean(rtt_ms_vals)), 4) if rtt_ms_vals else "NA"}
+               "n_seeds": agg["n_seeds"], "mean_success_pct": agg["mean"],
+               "std": agg["std"], "ci95_low": agg["ci95_low"], "ci95_high": agg["ci95_high"],
+               "seed_values": str(agg["values"])}
         append_csv_row(summary_csv, row)
-    return {"raw": agg_raw, "adjusted": agg_adjusted}
+    return agg
 
 
 def run_all_suites(policy, suites, n_tasks, episodes, seeds, out_csv, summary_csv,
-                   artifact, target_hz=None):
+                   artifact, target_hz=None, step_log_every=20,
+                   record_every=0, record_failures=False, record_dir="./benchmark/videos",
+                   live_view_path=None, live_view_every=1):
     """설계서 §2: 여러 suite를 순회해 능력별 성공률 분해를 얻는다."""
     results = {}
     for suite_name in suites:
         results[suite_name] = run_suite_multiseed(
             policy, suite_name, n_tasks, episodes, seeds, out_csv,
-            artifact, target_hz, summary_csv,
+            artifact, target_hz, summary_csv, step_log_every,
+            record_every, record_failures, record_dir,
+            live_view_path, live_view_every,
         )
     return results
 
@@ -317,20 +361,61 @@ def main():
                     help="단일 목표 Hz로 지연 주입(제어주파수 강제)")
     ap.add_argument("--target-hz-sweep", action="store_true",
                     help=f"확정 스윕값 {TARGET_HZ_SWEEP}Hz 전체를 순회")
+    # [신규] 진행 상황 로그 주기. 0이면 episode 안 step 로그를 끈다(episode 단위 로그는 항상 켜짐).
+    ap.add_argument("--step-log-every", type=int, default=20,
+                    help="이 step마다 진행 로그 출력(기본 20, 0이면 끔)")
+    # [신규] Jetson 응답 대기 시간. 기본 15초는 A0(7B) 등 느린 모델에서 timeout이 날 수 있어 늘림.
+    ap.add_argument("--timeout-ms", type=int, default=60000,
+                    help="policy 응답 대기 timeout(ms), 기본 60초")
+    # [신규] 영상 저장 옵션. 기본은 전부 꺼짐(프레임 수집 자체가 없어 오버헤드 0).
+    ap.add_argument("--record-every", type=int, default=0,
+                    help="이 episode마다 1개씩 영상 저장(0이면 끔). 예: 10 → 10개마다 1개")
+    ap.add_argument("--record-failures", action="store_true",
+                    help="실패한 episode는 항상 영상 저장(디버깅용)")
+    ap.add_argument("--record-dir", default="./benchmark/videos",
+                    help="영상 저장 폴더(기본 ./benchmark/videos)")
+    # [신규] 실시간 보기. headless라 진짜 창은 못 띄우지만, 이 경로의 이미지 파일이
+    # 매 step 계속 갱신된다 — 이미지 뷰어(예: feh --reload, 또는 파일탐색기 미리보기)로
+    # 열어두면 사실상 실시간처럼 볼 수 있다. 옆에 같은 이름 .txt에 현재 instruction도 남는다.
+    ap.add_argument("--live-view", default=None,
+                    help="이 경로에 현재 화면을 계속 덮어써 저장(예: ./live_view.jpg). "
+                         "기본 None(끔)")
+    ap.add_argument("--live-view-every", type=int, default=1,
+                    help="몇 step마다 live-view를 갱신할지(기본 1=매 step)")
     args = ap.parse_args()
 
     host, port = args.server.split(":")
-    policy = RemotePolicy(host, int(port))
+    policy = RemotePolicy(host, int(port), timeout_ms=args.timeout_ms)
     print("[client] ping:", policy.ping())
+
+    # [신규] 시작 전 전체 규모를 미리 안내 — "이게 대략 몇 episode짜리 실행인지" 가늠하게 한다.
+    total_episodes = len(args.suites) * args.n_tasks * args.episodes * len(args.seeds)
+    hz_note = f" x {len(TARGET_HZ_SWEEP)}개 target_hz" if args.target_hz_sweep else ""
+    print(f"[계획] suites={args.suites} x n_tasks={args.n_tasks} x episodes={args.episodes} "
+          f"x seeds={args.seeds}{hz_note} → 총 약 {total_episodes}{hz_note and '×N'} episode 예정")
+    if args.record_every or args.record_failures:
+        print(f"[계획] 영상 저장 활성화: every={args.record_every}, "
+              f"failures={args.record_failures}, dir={args.record_dir}")
+    if args.live_view:
+        print(f"[계획] 실시간 보기 활성화: {args.live_view} "
+              f"(같은 이름 .txt에 instruction 함께 기록, {args.live_view_every} step마다 갱신)")
 
     if args.target_hz_sweep:
         for hz in TARGET_HZ_SWEEP:
             print(f"\n########## target_hz={hz} ##########")
             run_all_suites(policy, args.suites, args.n_tasks, args.episodes, args.seeds,
-                           args.out_csv, args.summary_csv, args.artifact, target_hz=hz)
+                           args.out_csv, args.summary_csv, args.artifact, target_hz=hz,
+                           step_log_every=args.step_log_every,
+                           record_every=args.record_every, record_failures=args.record_failures,
+                           record_dir=args.record_dir,
+                           live_view_path=args.live_view, live_view_every=args.live_view_every)
     else:
         run_all_suites(policy, args.suites, args.n_tasks, args.episodes, args.seeds,
-                       args.out_csv, args.summary_csv, args.artifact, target_hz=args.target_hz)
+                       args.out_csv, args.summary_csv, args.artifact, target_hz=args.target_hz,
+                       step_log_every=args.step_log_every,
+                       record_every=args.record_every, record_failures=args.record_failures,
+                       record_dir=args.record_dir,
+                       live_view_path=args.live_view, live_view_every=args.live_view_every)
 
     policy.close()
 

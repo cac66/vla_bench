@@ -1,0 +1,3 @@
+[libero_spatial][seed=0][task 1/10][ep 1/50]
+instruction: pick up the black bowl between the plate and the ramekin and place it on the plate
+step: 158/220
