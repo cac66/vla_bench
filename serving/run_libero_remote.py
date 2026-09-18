@@ -60,10 +60,20 @@ def make_env(suite_name, task_id, res=256):
 
 
 def obs_to_dict(obs, instruction):
-    """LIBERO 관측 → 서버가 이해하는 obs dict. 서버가 모델별로 재가공한다."""
+    """LIBERO 관측 → 서버가 이해하는 obs dict. 서버가 모델별로 재가공한다.
+
+    [수정] 카메라 이미지를 상하 반전(`[::-1]`)한다. MuJoCo/robosuite 렌더링이
+    기본적으로 뒤집혀 나오는데, 이걸 그대로 모델에 넣으면 모델이 학습 때 본 것과
+    다른 방향의 장면으로 인식해 action이 어긋난다(실측: 반전 전엔 "위로 꿈틀거리며
+    gripper가 안 맞는" 증상, 반전 후엔 그릇 쪽으로 정상적으로 접근함을 확인).
+
+    주의: 이건 "모델이 보는 이미지"용 반전이다. 영상 저장/실시간보기(run_episode의
+    frames/live_view)는 사람이 보기 위한 것이라 별도로 반전한다 — 여기서 한 번
+    더 반전하지 않는다(두 반전은 서로 다른 목적이라 독립적으로 관리한다).
+    """
     def _img(key):
         v = obs.get(key)
-        return None if v is None else np.asarray(v, dtype=np.uint8)
+        return None if v is None else np.asarray(v, dtype=np.uint8)[::-1]
     state = np.concatenate([
         np.asarray(obs.get("robot0_eef_pos", np.zeros(3)), np.float32),
         np.asarray(obs.get("robot0_eef_quat", np.zeros(4)), np.float32),
@@ -165,12 +175,14 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
 
     for step_i in range(max_steps):
         if record:
-            frames.append(np.asarray(obs["agentview_image"], dtype=np.uint8))
+            # 모델 입력용 반전(obs_to_dict의 _img() 안)과는 별개로, 사람이 보는
+            # 영상도 정상 방향이어야 하므로 여기서 한 번 더 반전한다.
+            frames.append(np.asarray(obs["agentview_image"], dtype=np.uint8)[::-1])
 
         if live_view_path and (step_i % live_view_every == 0):
             status = (f"{progress_prefix}\ninstruction: {instruction}\n"
                      f"step: {step_i+1}/{max_steps}")
-            _write_live_view(live_view_path, obs["agentview_image"], live_text_path, status)
+            _write_live_view(live_view_path, obs["agentview_image"][::-1], live_text_path, status)
 
         t0 = time.perf_counter()
         try:
