@@ -39,12 +39,48 @@ from serving.policy_client import RemotePolicy
 from bench_common import append_csv_row, agg_seed_runs
 from smoothness import compute_smoothness
 
-# suite별 대략적 max step (공식값에 맞춰 조정)
-MAX_STEPS = {"libero_spatial": 220, "libero_object": 220,
+# suite별 max step (공식 run_libero_eval.py 값과 정확히 일치시킴)
+# [수정] libero_object가 220으로 잘못 들어가 있었음 → 공식값 280으로 정정
+MAX_STEPS = {"libero_spatial": 220, "libero_object": 280,
              "libero_goal": 300, "libero_10": 520}
+
+# [신규] 공식 run_libero_eval.py의 num_steps_wait, get_libero_dummy_action 반영.
+# "IMPORTANT: Do nothing for the first few timesteps because the simulator drops
+#  objects and we need to wait for them to fall" — 물체가 중력으로 떨어져 안착하기
+# 전에 관측을 시작하면, 모델이 "낙하 중인" 위치를 최종 위치로 오인해 정밀 조작이
+# 어긋난다. 반드시 policy.predict() 호출 전에 이 대기를 거쳐야 한다.
+NUM_STEPS_WAIT = 10
+LIBERO_DUMMY_ACTION = [0, 0, 0, 0, 0, 0, -1]
 
 ALL_SUITES = ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
 TARGET_HZ_SWEEP = [30, 15, 10, 6, 3]  # 확정된 제안값
+
+
+def normalize_gripper_action(action, binarize=True):
+    """
+    공식 openvla_utils.py/robot_utils.py의 함수를 그대로 반영.
+    Changes gripper action (last dimension) from [0,1] to [-1,+1].
+    Necessary because the dataset wrapper standardizes gripper actions to [0,1],
+    but robosuite/LIBERO controller expects [-1,+1].
+    """
+    action = np.array(action, dtype=np.float32).copy()
+    orig_low, orig_high = 0.0, 1.0
+    action[..., -1] = 2 * (action[..., -1] - orig_low) / (orig_high - orig_low) - 1
+    if binarize:
+        action[..., -1] = np.sign(action[..., -1])
+    return action
+
+
+def invert_gripper_action(action):
+    """
+    공식 코드 그대로 반영. [OpenVLA] The dataloader flips the sign of the gripper
+    action to align with other datasets (0=close, 1=open), so flip it back
+    (-1=open, +1=close) before executing — normalize_gripper_action 바로 다음,
+    model_family == "openvla"일 때 반드시 적용해야 한다(공식 코드는 조건부 호출).
+    """
+    action = np.array(action, dtype=np.float32).copy()
+    action[..., -1] = action[..., -1] * -1.0
+    return action
 
 
 def make_env(suite_name, task_id, res=256):
@@ -167,6 +203,13 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
     # set_init_state가 obs를 안 돌려주는 버전 대비: reset_obs로 폴백.
     obs = init_obs if isinstance(init_obs, dict) else reset_obs
 
+    # [신규] 물체가 중력으로 떨어져 안착할 때까지 대기 (공식 run_libero_eval.py의
+    # num_steps_wait). 이 대기 없이 바로 policy.predict()를 부르면, 모델이
+    # "낙하 중인" 물체 위치를 보고 판단해 정밀 조작(특히 gripper 타이밍)이 어긋난다.
+    # 대기 구간의 action은 정책 호출 없이 고정 dummy action으로 채운다.
+    for _ in range(NUM_STEPS_WAIT):
+        obs, reward, done_wait, info = env.step(LIBERO_DUMMY_ACTION)
+
     done = False
     actions = []
     frames = [] if record else None
@@ -193,6 +236,11 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
                   f"(episode 경과 {elapsed_ep:.1f}s): {e}")
             raise
         elapsed = time.perf_counter() - t0
+
+        # [신규] gripper 변환 — 공식 코드와 정확히 같은 순서로 적용해야 한다.
+        # 순서를 바꾸거나 하나만 적용하면 gripper open/close가 뒤집힌다(실측 확인됨).
+        action = normalize_gripper_action(action, binarize=True)
+        action = invert_gripper_action(action)  # model_family=="openvla" 조건, 우리는 openvla 고정
 
         actions.append(np.asarray(action, dtype=np.float32))
         obs, reward, done, info = env.step(action.tolist())  # 다음 루프의 obs를 여기서 확보
