@@ -54,6 +54,7 @@ def make_env(suite_name, task_id, res=256):
     task = suite.get_task(task_id)
     bddl = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
     env = OffScreenRenderEnv(bddl_file_name=bddl, camera_heights=res, camera_widths=res)
+    env.seed(0)
     init_states = suite.get_task_init_states(task_id)
     instruction = getattr(task, "language", "complete the task")
     return env, init_states, instruction
