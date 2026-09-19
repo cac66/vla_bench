@@ -143,6 +143,14 @@ def normalize_gripper_action(action, binarize=True):
         action[..., -1] = np.sign(action[..., -1]) if action[..., -1] != 0 else 1.0
     return action
 
+def invert_gripper_action(action):
+    """OpenVLA/RLDS 관례(0=close, 1=open)를 robosuite 관례(-1=open, +1=close)로
+    최종 맞추는 부호 반전. normalize_gripper_action 다음에 반드시 이어서 적용해야
+    한다(공식 openvla_utils.py의 두 함수를 그대로 순서대로 반영)."""
+    action = np.array(action, dtype=np.float32).copy()
+    action[..., -1] = action[..., -1] * -1.0
+    return action
+
 def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
                 progress_prefix="", step_log_every=20, record=False,
                 live_view_path=None, live_view_every=1):
@@ -204,6 +212,7 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
         elapsed = time.perf_counter() - t0
       
         action = normalize_gripper_action(action, binarize=True)   # ← 추가
+        action = invert_gripper_action(action)        # ← 추가, normalize 바로 다음
       
         actions.append(np.asarray(action, dtype=np.float32))
         obs, reward, done, info = env.step(action.tolist())  # 다음 루프의 obs를 여기서 확보
