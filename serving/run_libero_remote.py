@@ -132,7 +132,16 @@ def _write_live_view(path: str, image: np.ndarray, text_path: str = None, text: 
                 f.write(text)
     except Exception:
         pass  # 실시간 뷰는 실패해도 측정 자체를 막으면 안 된다
-
+      
+def normalize_gripper_action(action, binarize=True):
+    """OpenVLA는 gripper를 [0,1](0=open,1=close)로 학습했는데,
+    LIBERO/robosuite 컨트롤러는 [-1,1](-1=open,1=close)을 기대한다.
+    공식 OpenVLA LIBERO 배포 코드의 처리를 그대로 반영."""
+    action = np.array(action, dtype=np.float32).copy()
+    action[..., -1] = 2 * action[..., -1] - 1          # [0,1] -> [-1,1]
+    if binarize:
+        action[..., -1] = np.sign(action[..., -1]) if action[..., -1] != 0 else 1.0
+    return action
 
 def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
                 progress_prefix="", step_log_every=20, record=False,
