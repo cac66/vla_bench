@@ -54,7 +54,6 @@ def make_env(suite_name, task_id, res=256):
     task = suite.get_task(task_id)
     bddl = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
     env = OffScreenRenderEnv(bddl_file_name=bddl, camera_heights=res, camera_widths=res)
-    env.seed(0)
     init_states = suite.get_task_init_states(task_id)
     instruction = getattr(task, "language", "complete the task")
     return env, init_states, instruction
@@ -133,24 +132,7 @@ def _write_live_view(path: str, image: np.ndarray, text_path: str = None, text: 
                 f.write(text)
     except Exception:
         pass  # 실시간 뷰는 실패해도 측정 자체를 막으면 안 된다
-      
-def normalize_gripper_action(action, binarize=True):
-    """OpenVLA는 gripper를 [0,1](0=open,1=close)로 학습했는데,
-    LIBERO/robosuite 컨트롤러는 [-1,1](-1=open,1=close)을 기대한다.
-    공식 OpenVLA LIBERO 배포 코드의 처리를 그대로 반영."""
-    action = np.array(action, dtype=np.float32).copy()
-    action[..., -1] = 2 * action[..., -1] - 1          # [0,1] -> [-1,1]
-    if binarize:
-        action[..., -1] = np.sign(action[..., -1]) if action[..., -1] != 0 else 1.0
-    return action
 
-def invert_gripper_action(action):
-    """OpenVLA/RLDS 관례(0=close, 1=open)를 robosuite 관례(-1=open, +1=close)로
-    최종 맞추는 부호 반전. normalize_gripper_action 다음에 반드시 이어서 적용해야
-    한다(공식 openvla_utils.py의 두 함수를 그대로 순서대로 반영)."""
-    action = np.array(action, dtype=np.float32).copy()
-    action[..., -1] = action[..., -1] * -1.0
-    return action
 
 def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
                 progress_prefix="", step_log_every=20, record=False,
@@ -211,10 +193,7 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
                   f"(episode 경과 {elapsed_ep:.1f}s): {e}")
             raise
         elapsed = time.perf_counter() - t0
-      
-        action = normalize_gripper_action(action, binarize=True)   # ← 추가
-        action = invert_gripper_action(action)        # ← 추가, normalize 바로 다음
-      
+
         actions.append(np.asarray(action, dtype=np.float32))
         obs, reward, done, info = env.step(action.tolist())  # 다음 루프의 obs를 여기서 확보
 
