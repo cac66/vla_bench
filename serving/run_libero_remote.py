@@ -193,7 +193,9 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
                   f"(episode 경과 {elapsed_ep:.1f}s): {e}")
             raise
         elapsed = time.perf_counter() - t0
-
+      
+        action = normalize_gripper_action(action, binarize=True)   # ← 추가
+      
         actions.append(np.asarray(action, dtype=np.float32))
         obs, reward, done, info = env.step(action.tolist())  # 다음 루프의 obs를 여기서 확보
 
