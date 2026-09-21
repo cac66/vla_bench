@@ -109,7 +109,7 @@ def obs_to_dict(obs, instruction):
     """
     def _img(key):
         v = obs.get(key)
-        return None if v is None else np.asarray(v, dtype=np.uint8)[::-1]
+        return None if v is None else np.asarray(v, dtype=np.uint8)[::-1, ::-1]
     state = np.concatenate([
         np.asarray(obs.get("robot0_eef_pos", np.zeros(3)), np.float32),
         np.asarray(obs.get("robot0_eef_quat", np.zeros(4)), np.float32),
