@@ -29,6 +29,7 @@ LIBERO closed-loop rollout을 돌리되, 정책 추론은 Jetson 서버(RemotePo
 """
 
 import argparse
+import csv
 import os
 import time
 import numpy as np
@@ -90,7 +91,7 @@ def make_env(suite_name, task_id, res=256):
     task = suite.get_task(task_id)
     bddl = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
     env = OffScreenRenderEnv(bddl_file_name=bddl, camera_heights=res, camera_widths=res)
-    env.seed(0)  
+    env.seed(0)
     init_states = suite.get_task_init_states(task_id)
     instruction = getattr(task, "language", "complete the task")
     return env, init_states, instruction
@@ -99,10 +100,11 @@ def make_env(suite_name, task_id, res=256):
 def obs_to_dict(obs, instruction):
     """LIBERO 관측 → 서버가 이해하는 obs dict. 서버가 모델별로 재가공한다.
 
-    [수정] 카메라 이미지를 상하 반전(`[::-1]`)한다. MuJoCo/robosuite 렌더링이
-    기본적으로 뒤집혀 나오는데, 이걸 그대로 모델에 넣으면 모델이 학습 때 본 것과
-    다른 방향의 장면으로 인식해 action이 어긋난다(실측: 반전 전엔 "위로 꿈틀거리며
-    gripper가 안 맞는" 증상, 반전 후엔 그릇 쪽으로 정상적으로 접근함을 확인).
+    [수정 2] 카메라 이미지를 **180도 회전**(`[::-1, ::-1]`, 상하+좌우)한다.
+    공식 libero_utils.get_libero_image()의 "IMPORTANT: rotate 180 degrees to match
+    train preprocessing"을 그대로 반영. 이전 버전은 상하(`[::-1]`)만 뒤집어
+    좌우가 거울상이었고, 그 결과 로봇이 목표 근처까지는 가지만 좌우가 반대라
+    방황하며 한 번도 성공하지 못했다(5/5 실패 반복의 원인).
 
     주의: 이건 "모델이 보는 이미지"용 반전이다. 영상 저장/실시간보기(run_episode의
     frames/live_view)는 사람이 보기 위한 것이라 별도로 반전한다 — 여기서 한 번
@@ -263,10 +265,47 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
     return bool(done), action_seq, frames
 
 
+def _load_episode_progress(episode_csv, artifact, suite_name, seed, target_hz):
+    """
+    [신규] episode 단위 체크포인트 파일을 읽어, 이미 끝난 (task_id, ep_i)와
+    지금까지의 누적 통계(total/success/smoothness)를 복원한다.
+
+    왜 필요한가: 기존엔 seed 하나(수십~수백 episode)가 통째로 끝나야 CSV에
+    한 줄이 기록됐다. episode 하나가 3분 넘게 걸리는 상황에서 Ctrl+C로 중단하면
+    진행 중이던 seed 전체가 날아갔다. 이 함수는 "어디까지 했는지"를 읽어와서,
+    재실행 시 이미 끝난 episode는 건너뛰고 이어서 진행할 수 있게 한다.
+
+    파일이 없으면(첫 실행) 빈 상태를 반환한다 — 정상 동작이다.
+    """
+    done_keys = set()
+    total, success = 0, 0
+    ldlj_list, jerkrms_list = [], []
+    if not episode_csv or not os.path.exists(episode_csv):
+        return done_keys, total, success, ldlj_list, jerkrms_list
+
+    target_hz_str = str(target_hz) if target_hz else "NA"
+    with open(episode_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            if not (row.get("name") == artifact and row.get("suite") == suite_name
+                    and row.get("seed") == str(seed) and row.get("target_hz") == target_hz_str):
+                continue
+            done_keys.add((int(row["task_id"]), int(row["ep_i"])))
+            total += 1
+            success += 1 if row.get("success") in ("True", "1") else 0
+            ldlj = row.get("smoothness_ldlj")
+            if ldlj not in (None, "", "NA"):
+                ldlj_list.append(float(ldlj))
+            jerk = row.get("smoothness_jerkrms")
+            if jerk not in (None, "", "NA"):
+                jerkrms_list.append(float(jerk))
+    return done_keys, total, success, ldlj_list, jerkrms_list
+
+
 def run_suite_once(policy, suite_name, n_tasks, episodes, seed, out_csv,
                    artifact, target_hz=None, step_log_every=20,
                    record_every=0, record_failures=False, record_dir="./benchmark/videos",
-                   live_view_path=None, live_view_every=1):
+                   live_view_path=None, live_view_every=1,
+                   episode_csv="./benchmark/success_episodes.csv"):
     """
     한 suite를 한 seed로 1회 실행. 성공률 + smoothness(성공 episode 평균)를 반환.
     seed는 에피소드 서브샘플링(초기상태 셔플)에 사용해 실행 간 변동을 만든다.
@@ -286,15 +325,25 @@ def run_suite_once(policy, suite_name, n_tasks, episodes, seed, out_csv,
     [신규] live_view_path를 주면 실행 내내 그 경로의 이미지 파일이 계속 최신 화면으로
     갱신된다(headless 환경에서의 "실시간 보기"). 옆에 같은 이름의 .txt 파일에는 지금
     수행 중인 instruction·진행 step이 함께 기록된다.
+
+    [신규] episode_csv — Ctrl+C 안전장치이자 재개(resume) 기능. episode가 끝날 때마다
+    (out_csv와 별개로) 이 파일에 즉시 한 줄씩 기록한다. 중단 후 같은 명령으로 다시
+    실행하면, 이 파일을 먼저 읽어 이미 끝난 (task_id, ep_i)는 건너뛰고 이어서 진행한다.
+    None으로 주면 이 기능을 끈다(매 episode 파일 I/O가 부담스러운 경우).
     """
     rng = np.random.RandomState(seed)
     max_steps = MAX_STEPS.get(suite_name, 300)
-    total, success = 0, 0
-    ldlj_list, jerkrms_list = [], []
-    suite_t0 = time.perf_counter()
     want_record = bool(record_every) or record_failures  # 이게 꺼져있으면 프레임 수집 자체를 생략
-
     dt = 1.0 / target_hz if target_hz else 1.0  # smoothness 계산용 시간 스케일
+
+    # [신규] 이전에 중단된 지점이 있으면 복원, 없으면 빈 상태로 시작(첫 실행과 동일)
+    done_keys, total, success, ldlj_list, jerkrms_list = _load_episode_progress(
+        episode_csv, artifact, suite_name, seed, target_hz)
+    if done_keys:
+        print(f"[{suite_name}][seed={seed}] 이전 진행 기록 발견: {len(done_keys)}개 episode 이미 완료 "
+              f"— 이어서 진행한다 (성공 {success}/{total})")
+
+    suite_t0 = time.perf_counter()
 
     for task_id in range(n_tasks):
         env, init_states, instruction = make_env(suite_name, task_id)
@@ -303,6 +352,9 @@ def run_suite_once(policy, suite_name, n_tasks, episodes, seed, out_csv,
         n_this_task = len(order)
 
         for ep_i, idx in enumerate(order):
+            if (task_id, ep_i) in done_keys:
+                continue  # [신규] 이미 끝난 episode는 재실행하지 않고 건너뜀
+
             prefix = (f"[{suite_name}][seed={seed}]"
                      f"[task {task_id+1}/{n_tasks}][ep {ep_i+1}/{n_this_task}]")
             ep_t0 = time.perf_counter()
@@ -336,12 +388,25 @@ def run_suite_once(policy, suite_name, n_tasks, episodes, seed, out_csv,
                 if save_video(frames, path):
                     print(f"{prefix} [record] 저장({'+'.join(save_reason)}): {path}")
 
+            ep_ldlj, ep_jerk = "NA", "NA"
             if ok and len(action_seq) >= 5:
                 sm = compute_smoothness(action_seq, dt=dt, success=True)
                 if sm["smoothness_ldlj"] != "NA":
                     ldlj_list.append(sm["smoothness_ldlj"])
+                    ep_ldlj = sm["smoothness_ldlj"]
                 if sm["smoothness_jerkrms"] != "NA":
                     jerkrms_list.append(sm["smoothness_jerkrms"])
+                    ep_jerk = sm["smoothness_jerkrms"]
+
+            # [신규] episode 하나 끝날 때마다 즉시 기록 (Ctrl+C 안전장치)
+            if episode_csv:
+                append_csv_row(episode_csv, {
+                    "name": artifact, "suite": suite_name, "seed": seed,
+                    "target_hz": target_hz if target_hz else "NA",
+                    "task_id": task_id, "ep_i": ep_i,
+                    "success": ok, "steps": len(action_seq),
+                    "smoothness_ldlj": ep_ldlj, "smoothness_jerkrms": ep_jerk,
+                })
         env.close()
 
     rate = 100.0 * success / max(total, 1)
@@ -364,16 +429,24 @@ def run_suite_once(policy, suite_name, n_tasks, episodes, seed, out_csv,
 def run_suite_multiseed(policy, suite_name, n_tasks, episodes, seeds, out_csv,
                         artifact, target_hz=None, summary_csv=None, step_log_every=20,
                         record_every=0, record_failures=False, record_dir="./benchmark/videos",
-                        live_view_path=None, live_view_every=1):
+                        live_view_path=None, live_view_every=1,
+                        episode_csv="./benchmark/success_episodes.csv"):
     """
     같은 suite를 여러 seed로 반복해 success_rate의 평균/표준편차/95% CI를 낸다(확정: 3 seed 기본).
+
+    [신규] episode_csv 덕분에, 이 함수가 seed 진행 도중 중단돼도 다음 실행에서
+    이미 끝난 episode는 건너뛰고 이어서 진행한다. 단, 이미 완전히 끝난 seed를
+    포함해 전체를 다시 실행하면(재실행 자체를 한 것이므로) out_csv/summary_csv에
+    같은 내용의 행이 한 번 더 추가될 수 있다 — episode 재실행은 안 하지만(빠르게
+    건너뜀), 집계 행 자체는 다시 쓰인다는 점은 알아둔다(데이터 손상은 아니고
+    중복 행 정도이며, episode_csv가 항상 진실의 원천이다).
     """
     rates = []
     for seed in seeds:
         rate, _, _ = run_suite_once(policy, suite_name, n_tasks, episodes, seed,
                                     out_csv, artifact, target_hz, step_log_every,
                                     record_every, record_failures, record_dir,
-                                    live_view_path, live_view_every)
+                                    live_view_path, live_view_every, episode_csv)
         rates.append(rate)
 
     agg = agg_seed_runs(rates)
@@ -393,7 +466,8 @@ def run_suite_multiseed(policy, suite_name, n_tasks, episodes, seeds, out_csv,
 def run_all_suites(policy, suites, n_tasks, episodes, seeds, out_csv, summary_csv,
                    artifact, target_hz=None, step_log_every=20,
                    record_every=0, record_failures=False, record_dir="./benchmark/videos",
-                   live_view_path=None, live_view_every=1):
+                   live_view_path=None, live_view_every=1,
+                   episode_csv="./benchmark/success_episodes.csv"):
     """설계서 §2: 여러 suite를 순회해 능력별 성공률 분해를 얻는다."""
     results = {}
     for suite_name in suites:
@@ -401,7 +475,7 @@ def run_all_suites(policy, suites, n_tasks, episodes, seeds, out_csv, summary_cs
             policy, suite_name, n_tasks, episodes, seeds, out_csv,
             artifact, target_hz, summary_csv, step_log_every,
             record_every, record_failures, record_dir,
-            live_view_path, live_view_every,
+            live_view_path, live_view_every, episode_csv,
         )
     return results
 
@@ -443,7 +517,15 @@ def main():
                          "기본 None(끔)")
     ap.add_argument("--live-view-every", type=int, default=1,
                     help="몇 step마다 live-view를 갱신할지(기본 1=매 step)")
+    # [신규] Ctrl+C 안전장치 + 재개(resume). episode가 끝날 때마다 즉시 이 파일에
+    # 기록하고, 재실행 시 이미 끝난 episode는 건너뛴다. --no-episode-checkpoint로 끌 수 있다.
+    ap.add_argument("--episode-csv", default="./benchmark/success_episodes.csv",
+                    help="episode 단위 체크포인트 파일 경로(기본 ./benchmark/success_episodes.csv)")
+    ap.add_argument("--no-episode-checkpoint", action="store_true",
+                    help="episode 단위 체크포인트/재개 기능을 끈다(매 episode 파일 I/O 생략)")
     args = ap.parse_args()
+
+    episode_csv = None if args.no_episode_checkpoint else args.episode_csv
 
     host, port = args.server.split(":")
     policy = RemotePolicy(host, int(port), timeout_ms=args.timeout_ms)
@@ -460,6 +542,11 @@ def main():
     if args.live_view:
         print(f"[계획] 실시간 보기 활성화: {args.live_view} "
               f"(같은 이름 .txt에 instruction 함께 기록, {args.live_view_every} step마다 갱신)")
+    if episode_csv:
+        print(f"[계획] episode 체크포인트 활성화: {episode_csv} "
+              f"(Ctrl+C 후 같은 명령으로 재실행하면 이어서 진행됨)")
+    else:
+        print("[계획] episode 체크포인트 꺼짐 — 중단 시 진행 중이던 seed 전체가 저장 안 됨에 주의")
 
     if args.target_hz_sweep:
         for hz in TARGET_HZ_SWEEP:
@@ -469,14 +556,16 @@ def main():
                            step_log_every=args.step_log_every,
                            record_every=args.record_every, record_failures=args.record_failures,
                            record_dir=args.record_dir,
-                           live_view_path=args.live_view, live_view_every=args.live_view_every)
+                           live_view_path=args.live_view, live_view_every=args.live_view_every,
+                           episode_csv=episode_csv)
     else:
         run_all_suites(policy, args.suites, args.n_tasks, args.episodes, args.seeds,
                        args.out_csv, args.summary_csv, args.artifact, target_hz=args.target_hz,
                        step_log_every=args.step_log_every,
                        record_every=args.record_every, record_failures=args.record_failures,
                        record_dir=args.record_dir,
-                       live_view_path=args.live_view, live_view_every=args.live_view_every)
+                       live_view_path=args.live_view, live_view_every=args.live_view_every,
+                       episode_csv=episode_csv)
 
     policy.close()
 
