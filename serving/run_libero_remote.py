@@ -220,12 +220,12 @@ def run_episode(policy, env, init_state, instruction, max_steps, target_hz=None,
         if record:
             # 모델 입력용 반전(obs_to_dict의 _img() 안)과는 별개로, 사람이 보는
             # 영상도 정상 방향이어야 하므로 여기서 한 번 더 반전한다.
-            frames.append(np.asarray(obs["agentview_image"], dtype=np.uint8)[::-1])
+            frames.append(np.asarray(obs["agentview_image"], dtype=np.uint8)[::-1, ::-1])
 
         if live_view_path and (step_i % live_view_every == 0):
             status = (f"{progress_prefix}\ninstruction: {instruction}\n"
                      f"step: {step_i+1}/{max_steps}")
-            _write_live_view(live_view_path, obs["agentview_image"][::-1], live_text_path, status)
+            _write_live_view(live_view_path, obs["agentview_image"][::-1, ::-1], live_text_path, status)
 
         t0 = time.perf_counter()
         try:
