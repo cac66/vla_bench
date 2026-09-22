@@ -17,6 +17,8 @@ bench_common.py
 import gc
 import os
 import csv
+import glob
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Any
@@ -24,7 +26,7 @@ from typing import Callable, Optional, Any
 import torch
 from tegra_profiler import TegraProfiler
 
-from energy import SysfsPowerSampler, measure_idle_baseline, energy_summary
+from energy import SysfsPowerSampler, measure_idle_baseline, energy_summary, COMPUTE_RAILS, TOTAL_RAILS
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +164,41 @@ def run_artifact(spec: ArtifactSpec) -> None:
             except Exception as e:
                 print(f"[warn] accuracy 기록 실패({label}): {e}")
 
+    # [신규] TegraProfiler가 저장한 원본 파일(timeseries.csv, report.md)의 이름을
+    # "날짜+숫자(run_id)"에서 "run_id+artifact명"으로 바꾼다. run_id 자체(타임스탬프)는
+    # 유지한다 — 같은 artifact를 여러 번 측정해도 파일이 서로 안 덮어써지게 하려면
+    # 여전히 시간 구분이 필요하기 때문이다. 다만 파일명만 봐도 "어느 artifact인지"
+    # 바로 알 수 있도록 뒤에 artifact명을 덧붙인다.
+    #
+    # TegraProfiler의 정확한 내부 속성명을 우리가 통제하지 않으므로(외부 도구),
+    # 두 단계로 안전하게 찾는다: ① prof.run_id 속성이 있으면 그걸 신뢰,
+    # ② 없으면 runs/ 폴더에서 방금(이 함수 호출 동안) 새로 생긴 파일을 찾는다.
+    runs_dir = os.path.join(spec.out_root, "runs")
+    run_id = getattr(prof, "run_id", None)
+    if run_id is None:
+        # 폴백: 이번 run_artifact() 호출 중 새로 생긴 .md 파일을 찾는다(가장 최근 수정).
+        candidates = sorted(glob.glob(os.path.join(runs_dir, "*.md")), key=os.path.getmtime)
+        if candidates:
+            run_id = os.path.splitext(os.path.basename(candidates[-1]))[0]
+
+    if run_id:
+        safe_name = spec.name.replace("/", "_")
+        renamed_any = False
+        for suffix, ext in [("_timeseries", ".csv"), ("", ".md")]:
+            old_path = os.path.join(runs_dir, f"{run_id}{suffix}{ext}")
+            new_path = os.path.join(runs_dir, f"{run_id}_{safe_name}{suffix}{ext}")
+            if os.path.exists(old_path):
+                shutil.move(old_path, new_path)
+                renamed_any = True
+        if renamed_any:
+            print(f"[tegra_profiler] 원본 파일 이름 변경 완료: {run_id}_{safe_name}*")
+        else:
+            print(f"[warn] TegraProfiler 원본 파일을 찾지 못해 이름 변경을 건너뜀 "
+                  f"(run_id={run_id}, runs_dir={runs_dir}) — TegraProfiler의 실제 속성명을 "
+                  f"확인해 알려주면 정확히 맞춰 수정하겠다")
+    else:
+        print(f"[warn] run_id를 확인할 수 없어 TegraProfiler 원본 파일 이름 변경을 건너뜀")
+
     # ⑤~⑥ 에너지 요약 계산 및 별도 CSV 기록 (성능 CSV는 TegraProfiler가 이미 저장)
     # [정정] compute(GPU+CPU)와 total(+시스템 5V) 두 지표를 한 행에 함께 기록한다.
     if energy_sampler is not None:
@@ -171,8 +208,18 @@ def run_artifact(spec: ArtifactSpec) -> None:
                "measure_iters": spec.measure_iters, **summary}
         append_csv_row(f"{spec.out_root}/energy.csv", row)
         print(f"[energy] {label}: "
-              f"compute net={summary['net_power_w_compute']}W/{summary['energy_mj_per_action_compute']}mJ  "
-              f"total net={summary['net_power_w_total']}W/{summary['energy_mj_per_action_total']}mJ")
+              f"compute net={summary['net_power_w_compute']}W "
+              f"(peak={summary['peak_power_w_compute']}W p95={summary['p95_power_w_compute']}W) "
+              f"/{summary['energy_mj_per_action_compute']}mJ  "
+              f"total net={summary['net_power_w_total']}W "
+              f"(peak={summary['peak_power_w_total']}W p95={summary['p95_power_w_total']}W) "
+              f"/{summary['energy_mj_per_action_total']}mJ")
+
+        # [신규] 전력 시계열을 CSV로 저장 — peak/p95 숫자로는 안 보이는 "패턴의 모양"
+        # (톱니형 반복 vs 고르게 낮음)을 그래프로 직접 확인하기 위함.
+        ts_path = f"{spec.out_root}/power_timeseries/{spec.name}.csv"
+        energy_sampler.save_timeseries_csv(ts_path, {"compute_w": COMPUTE_RAILS, "total_w": TOTAL_RAILS})
+        print(f"[energy] 전력 시계열 저장: {ts_path}")
 
     free_model(model)
     print(f"=== [{label}] 완료 → {spec.out_root} ===")
