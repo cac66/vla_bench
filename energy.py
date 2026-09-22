@@ -28,6 +28,7 @@ sysfs(INA3221 hwmon) 직접 폴링 기반 에너지 측정.
   - 정규화: energy_mj_per_action (compute/total 각각)
 """
 
+import os
 import time
 import threading
 
@@ -104,6 +105,54 @@ class SysfsPowerSampler:
             return 0.0
         return sum(p for _, p in series) / len(series)
 
+    def max_power_w(self, sum_rails) -> float:
+        """
+        [신규] 측정 구간 중 관측된 순간 최고 전력(peak). mean_power_w와 비교하면
+        "평균은 낮은데 peak도 낮은지, 아니면 peak는 높은데 그 상태를 짧게만
+        유지해서 평균이 낮아진 건지"를 구분할 수 있다.
+        예: A1(bnb 8bit, outlier 분해)의 평균 전력이 낮게 측정됐을 때, 이게
+        "항상 약하게 도는 것"인지 "짧게 세게 돌고 나머지는 거의 쉬는 것"인지는
+        평균만으로는 구분 불가능 — peak를 함께 봐야 한다.
+        """
+        series = self._sum_series(sum_rails)
+        if not series:
+            return 0.0
+        return max(p for _, p in series)
+
+    def p95_power_w(self, sum_rails) -> float:
+        """
+        [신규] 상위 5% 지점의 전력(peak 근처가 얼마나 "자주" 나타나는지를 본다).
+        max_power_w는 단 한 샘플의 순간 튐일 수 있어 노이즈에 약하다. p95는
+        "peak 근처 상태가 어느 정도 지속적으로 나타나는가"를 더 안정적으로 보여준다.
+        """
+        series = self._sum_series(sum_rails)
+        if not series:
+            return 0.0
+        powers = sorted(p for _, p in series)
+        idx = max(0, int(len(powers) * 0.95) - 1)
+        return powers[idx]
+
+    def save_timeseries_csv(self, path: str, sum_rails_dict: dict) -> None:
+        """
+        [신규] 시계열 원본을 CSV로 저장한다. peak/p95/mean 같은 요약 숫자로는
+        "짧고 세게 반복되는 톱니 패턴"인지 "그냥 전반적으로 낮은 것"인지 구분이
+        안 되므로, 그래프로 직접 눈으로 확인하기 위한 원본 데이터를 남긴다.
+
+        sum_rails_dict: {"compute": (1,2), "total": (1,2,3)} 처럼 여러 지표를
+        한 파일에 같이 담고 싶을 때 컬럼별로 지정한다.
+        """
+        import csv
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fieldnames = ["t_s"] + list(sum_rails_dict.keys())
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(fieldnames)
+            for t, rails in self._samples:
+                row = [round(t, 4)]
+                for name, sum_rails in sum_rails_dict.items():
+                    row.append(round(sum(rails.get(r, 0.0) for r in sum_rails), 4))
+                w.writerow(row)
+
     def energy_j(self, sum_rails) -> float:
         """샘플을 사다리꼴로 시간 적분해 총 에너지(J)를 구한다."""
         series = self._sum_series(sum_rails)
@@ -140,6 +189,8 @@ def measure_idle_baseline(duration_s: float = 30.0, interval_s: float = 0.1) -> 
 
 def _one_metric_summary(sampler: SysfsPowerSampler, sum_rails, idle_w: float, n_actions: int, suffix: str) -> dict:
     te = sampler.mean_power_w(sum_rails)
+    peak = sampler.max_power_w(sum_rails)          # [신규]
+    p95 = sampler.p95_power_w(sum_rails)            # [신규]
     dur = sampler.duration_s()
     net_power = max(te - idle_w, 0.0)  # 음수 방지(노이즈로 BE가 더 클 수 있음)
     e_total = sampler.energy_j(sum_rails)
@@ -148,6 +199,8 @@ def _one_metric_summary(sampler: SysfsPowerSampler, sum_rails, idle_w: float, n_
     return {
         f"idle_power_w_{suffix}": round(idle_w, 4),
         f"active_power_w_{suffix}": round(te, 4),
+        f"peak_power_w_{suffix}": round(peak, 4),     # [신규]
+        f"p95_power_w_{suffix}": round(p95, 4),        # [신규]
         f"net_power_w_{suffix}": round(net_power, 4),
         f"energy_j_total_{suffix}": round(e_total, 4),
         f"energy_j_net_{suffix}": round(e_net, 4),
