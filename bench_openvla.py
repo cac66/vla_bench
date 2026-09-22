@@ -197,9 +197,7 @@ LOADERS = {
     "A1b_int8_nooutlier":load_int8_no_outlier, "A2_int4": load_int4_bnb,
     "A3_int4_awq": load_awq, "A4_int4_compile": load_int4_compiled,
     "A5_token_prune": load_token_prune,
-}build_inputs=build_inputs_openvla,
-                 notes="nf4 + compile", **COMMON),
-    ArtifactSpec(name="
+}
 
 
 # --- breakdown ----------------------------------------------------------------
