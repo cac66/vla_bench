@@ -12,6 +12,11 @@ artifact ↔ 메타데이터
   A0 fp16/pytorch/none  | A1 int8/pytorch/none(bnb 8bit) | A2 int4/pytorch/none(bnb nf4)
   A3 int4/pytorch/awq   | A4 int4/pytorch/torch_compile  | A5 fp16/pytorch/token_prune
 """
+import transformers.modeling_utils as _mu
+_original_dispatch_model = _mu.dispatch_model
+def _dispatch_model_noop(model, **kwargs):
+    return model
+_mu.dispatch_model = _dispatch_model_noop
 
 import argparse
 import numpy as np
@@ -21,8 +26,9 @@ from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConf
 
 from bench_common import ArtifactSpec, run_all, screen_mse, filter_specs, SubmoduleTimer
 
-CKPT = "openvla/openvla-7b-finetuned-libero-spatial"   # suite에 맞게 교체
-AWQ_CKPT = "./ckpts/openvla-libero-spatial-awq"
+
+CKPT = "/workspace/ckpts/openvla-libero-spatial"
+AWQ_CKPT = "/workspace/ckpts/openvla-libero-spatial-awq"
 UNNORM_KEY = "libero_spatial"   # 실제 checkpoint의 dataset_statistics.json 키와 일치 확인됨
 DEVICE = "cuda:0"
 DTYPE = torch.bfloat16
@@ -70,7 +76,8 @@ def preprocess_openvla(extras, obs_dict):
 
     prompt = PROMPT_TMPL.format(instr=obs_dict.get("instruction", "pick up the object"))
     inputs = proc(prompt, img)
-    inputs = {k: (v.to(DEVICE, dtype=DTYPE) if torch.is_floating_point(v) else v.to(DEVICE))
+    input_dtype = extras.get("input_dtype", DTYPE)
+    inputs = {k: (v.to(DEVICE, dtype=input_dtype) if torch.is_floating_point(v) else v.to(DEVICE))
               for k, v in inputs.items()}
     return inputs
 
@@ -113,19 +120,53 @@ def load_fp16():
 
 def load_int8_bnb():
     bnb = BitsAndBytesConfig(load_in_8bit=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        CKPT, trust_remote_code=True, torch_dtype=DTYPE,
-        quantization_config=bnb, device_map={"": 0}, low_cpu_mem_usage=True).eval()
-    return model, {"processor": _proc()}
+    with torch.device("cuda"):
+        model = AutoModelForVision2Seq.from_pretrained(
+            CKPT, trust_remote_code=True, 
+            quantization_config=bnb, device_map=None)
+    model.eval()
+    # 실제 vision backbone dtype을 찾아 extras에 기록
+    actual_dtype = next(p.dtype for n, p in model.named_parameters() if "vision" in n or "featurizer" in n)
+    return model, {"processor": _proc(), "input_dtype": actual_dtype}
 
+def load_int8_no_outlier():
+    """A1b: INT8이되 mixed-precision outlier 분해를 비활성화한 버전.
+
+    llm_int8_threshold=0.0은 "모든 column을 int8로 양자화하고 분해를 하지 않는다"는
+    뜻이다(공식 문서 기준). A1(기본 threshold=6.0, 분해 O)과 비교하면 '분해 알고리즘
+    자체의 비용'이 분리되고, A2(NF4)와 비교하면 '비트 수 효과'가 분리된다.
+
+    주의: 분해를 끄면 활성화 이상치가 int8로 뭉개져 정확도가 떨어질 수 있다
+    (이게 원래 분해가 존재하는 이유다). 따라서 이 artifact는 '속도 원인 규명용
+    ablation'이지, 실제 배포 후보가 아니다 — MSE 스크리닝으로 정확도 손실을 반드시 확인한다.
+    """
+    bnb = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=0.0,   # ← 0.0이 "분해 비활성화". inf 아님.
+    )
+    with torch.device("cuda"):
+        model = AutoModelForVision2Seq.from_pretrained(
+            CKPT, trust_remote_code=True, quantization_config=bnb, device_map=None,
+        )
+    model.eval()
+    actual_dtype = next(p.dtype for n, p in model.named_parameters()
+                        if "vision" in n or "featurizer" in n)
+    return model, {"processor": _proc(), "input_dtype": actual_dtype}
 
 def load_int4_bnb():
-    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                             bnb_4bit_compute_dtype=DTYPE, bnb_4bit_use_double_quant=True)
-    model = AutoModelForVision2Seq.from_pretrained(
-        CKPT, trust_remote_code=True, torch_dtype=DTYPE,
-        quantization_config=bnb, device_map={"": 0}, low_cpu_mem_usage=True).eval()
-    return model, {"processor": _proc()}
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,   # ← 명시적으로 지정 (기본값 fp32 방지)
+        bnb_4bit_use_double_quant=True,
+    )
+    with torch.device("cuda"):
+        model = AutoModelForVision2Seq.from_pretrained(
+            CKPT, trust_remote_code=True, quantization_config=bnb, device_map=None,
+        )
+    model.eval()
+    actual_dtype = next(p.dtype for n, p in model.named_parameters() if "vision" in n or "featurizer" in n)
+    return model, {"processor": _proc(), "input_dtype": actual_dtype}
 
 
 def load_awq():
@@ -152,10 +193,13 @@ def load_token_prune():
 
 
 LOADERS = {
-    "A0_fp16": load_fp16, "A1_int8": load_int8_bnb, "A2_int4": load_int4_bnb,
+    "A0_fp16": load_fp16, "A1_int8": load_int8_bnb,
+    "A1b_int8_nooutlier":load_int8_no_outlier, "A2_int4": load_int4_bnb,
     "A3_int4_awq": load_awq, "A4_int4_compile": load_int4_compiled,
     "A5_token_prune": load_token_prune,
-}
+}build_inputs=build_inputs_openvla,
+                 notes="nf4 + compile", **COMMON),
+    ArtifactSpec(name="
 
 
 # --- breakdown ----------------------------------------------------------------
@@ -187,6 +231,9 @@ ARTIFACTS = [
                  load_model=load_fp16, build_inputs=build_inputs_openvla, notes="baseline", **COMMON),
     ArtifactSpec(name="A1_int8", precision="int8", technique="none",
                  load_model=load_int8_bnb, build_inputs=build_inputs_openvla, notes="bnb 8bit", **COMMON),
+    ArtifactSpec(name="A1b_int8_nooutlier", precision="int8", technique="no_outlier",
+                 load_model=load_int8_no_outlier, build_inputs=build_inputs_openvla,
+                 notes="bnb 8bit, llm_int8_threshold=0.0 (분해 비활성화, ablation용)", **COMMON), 
     ArtifactSpec(name="A2_int4", precision="int4", technique="none",
                  load_model=load_int4_bnb, build_inputs=build_inputs_openvla, notes="bnb nf4", **COMMON),
     ArtifactSpec(name="A3_int4_awq", precision="int4", technique="awq",
